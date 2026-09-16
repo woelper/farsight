@@ -40,6 +40,10 @@ cargo run -p predict-eval --example eval_sample
 ## Try it
 
 ```sh
+./scripts/start.sh                # build, start daemon, launch CLI (needs a terminal)
+./scripts/start.sh --daemon-only  # daemon only; test with ./target/debug/predict-cli
+./scripts/start.sh --stop         # stop the daemon
+# manual equivalent:
 ./target/debug/predictd &          # start the per-user daemon
 ./target/debug/predict-cli         # type; Tab accepts, Enter commits, Esc quits
 ```
