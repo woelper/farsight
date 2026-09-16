@@ -2,6 +2,26 @@
 
 All notable changes to `predict` are documented here, per milestone.
 
+## [0.4.0] — M3 slow tier (local LLM)
+
+- `predict-llm`: sync `Backend` trait (`complete_sentence` + `CancelToken`),
+  `LlamaBackend` on a worker thread (llama-cpp-2 0.1.156): greedy decoding,
+  strip-and-constrain token healing, mean-logprob gate (default −1.0),
+  consecutive-position KV reuse, `LlmConfig` from `[llm]` TOML,
+  `StubBackend` for tests. Model: Qwen2.5-1.5B base Q4_K_M (gitignored).
+- `predict-proto`: v2 (`PROTOCOL_VERSION = 2`) with `SuggestSentence` /
+  `Sentence{generation, text, confidence}`.
+- `predictd`: sentence worker threads with shared cancel state (stale work
+  stays silent), write mutex, config `~/.config/predict/predictd.toml`,
+  graceful degradation to word-only.
+- `predict-cli`: 200 ms pause gating (`poll`), grey inline sentence,
+  Ctrl+Right accepts, deadline reads that discard foreign frames.
+- `predict-eval`: unified word+sentence simulation (`evaluate_combined`),
+  acceptance proxy, wrong-suggestion rate, TTFT percentiles.
+- Measured: 24/51 sentences accepted, wrong rate 0.40, TTFT p50 ~160 ms,
+  combined savings 0.755 vs M1 0.722 (**+49 keystrokes**).
+- Docs: `docs/adr/0004-m3-slow-tier.md`, ARCHITECTURE status + results.
+
 ## [0.3.0] — M2 daemon + test client
 
 - `predict-proto`: versioned envelopes (`PROTOCOL_VERSION = 1`), `postcard`

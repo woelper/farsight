@@ -35,6 +35,8 @@ cargo test
 cargo clippy -- -D warnings
 # run the eval on the sample corpus:
 cargo run -p predict-eval --example eval_sample
+# sentence-tier eval (needs a GGUF model):
+cargo run -p predict-eval --example eval_sentence -- <model.gguf> [threshold]
 ```
 
 ## Try it
@@ -45,12 +47,24 @@ cargo run -p predict-eval --example eval_sample
 ./scripts/start.sh --stop         # stop the daemon
 # manual equivalent:
 ./target/debug/predictd &          # start the per-user daemon
-./target/debug/predict-cli         # type; Tab accepts, Enter commits, Esc quits
+./target/debug/predict-cli         # type; Tab accepts word, pause for grey
+                                   # sentence, Ctrl+Right accepts it, Esc quits
+```
+
+To enable the slow tier, place a GGUF model (e.g. Qwen2.5-1.5B base Q4_K_M)
+at a known path and write `~/.config/predict/predictd.toml`:
+
+```toml
+[llm]
+enabled = true
+model_path = "/path/to/qwen2.5-1.5b-q4_k_m.gguf"
+max_tokens = 32
+confidence_threshold = -1.0
 ```
 
 ## Status
 
-M2 done — daemon (`predictd`) + terminal client (`predict-cli`) work over
-versioned IPC: typing shows live suggestions with no perceptible lag.
-M1 fast tier numbers hold (top-1 0.897, savings 0.722, p99 0.181 ms).
-LLM tier, store, style, IBus still placeholders.
+M3 done — slow LLM tier works end to end: pause for a grey sentence
+suggestion, Ctrl+Right accepts; eval shows +49 keystrokes over the word
+tier (savings 0.755 vs 0.722, TTFT p50 ~160 ms).
+Store, style, IBus still placeholders.

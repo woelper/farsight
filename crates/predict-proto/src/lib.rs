@@ -1,7 +1,8 @@
 //! IPC messages between predictd, frontends, and test clients.
 //!
 //! Versioned envelopes serialized with `postcard`, sent as
-//! `u32`-length-prefixed frames over a Unix socket. See ADR 0003.
+//! `u32`-length-prefixed frames over a Unix socket. See ADR 0003 (v1) and
+//! ADR 0004 (v2: sentence messages for the slow tier).
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -10,7 +11,7 @@ use thiserror::Error;
 
 /// Protocol version. Any breaking change bumps this; readers reject frames
 /// whose version differs.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum frame payload in bytes (postcard body, excluding length prefix).
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
@@ -90,8 +91,11 @@ pub struct CancelMsg {
 pub enum ClientMsg {
     /// Latest typing context.
     ContextUpdate(ContextUpdate),
-    /// Ask for suggestions.
+    /// Ask for word suggestions (fast tier, answered synchronously).
     Suggest(SuggestRequest),
+    /// Ask for a sentence continuation (slow tier, answered asynchronously;
+    /// silence means stale, cancelled, or gated).
+    SuggestSentence(SuggestRequest),
     /// Cancel a generation.
     Cancel(CancelMsg),
 }
@@ -116,11 +120,27 @@ pub struct Suggestion {
     pub style_id: String,
 }
 
+/// Sentence continuation for one generation (slow tier).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SentenceSuggestion {
+    /// Generation this answers.
+    pub generation: u64,
+    /// Continuation AFTER the context text (may be empty when the daemon
+    /// has nothing worth showing, e.g. LLM disabled).
+    pub text: String,
+    /// Mean token logprob of the shown text (higher is better, ≤ 0).
+    pub confidence: f32,
+    /// Style id the suggestion was made under.
+    pub style_id: String,
+}
+
 /// Daemon to client messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DaemonMsg {
-    /// Suggestions for a generation.
+    /// Word suggestions for a generation.
     Suggestion(Suggestion),
+    /// Sentence continuation for a generation.
+    Sentence(SentenceSuggestion),
 }
 
 /// Version envelope around every frame payload.
@@ -229,6 +249,7 @@ mod tests {
     #[test]
     fn suggest_and_cancel_roundtrip() {
         roundtrip_client(&ClientMsg::Suggest(SuggestRequest { generation: 41 }));
+        roundtrip_client(&ClientMsg::SuggestSentence(SuggestRequest { generation: 42 }));
         roundtrip_client(&ClientMsg::Cancel(CancelMsg { generation: 41 }));
     }
 
@@ -246,6 +267,20 @@ mod tests {
                     score: 1.0,
                 },
             ],
+            style_id: "default".to_string(),
+        });
+        let mut buf = Cursor::new(Vec::new());
+        write_daemon_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        assert_eq!(read_daemon_msg(&mut buf).unwrap(), msg);
+    }
+
+    #[test]
+    fn sentence_suggestion_roundtrips() {
+        let msg = DaemonMsg::Sentence(SentenceSuggestion {
+            generation: 3,
+            text: "brown fox.".to_string(),
+            confidence: -0.4,
             style_id: "default".to_string(),
         });
         let mut buf = Cursor::new(Vec::new());
@@ -280,7 +315,10 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtoError::VersionMismatch { expected: 1, got: 2 }
+                ProtoError::VersionMismatch {
+                    expected: PROTOCOL_VERSION,
+                    got: 3
+                }
             ),
             "unexpected error: {err:?}"
         );

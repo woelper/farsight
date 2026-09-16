@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 predict-core = { path = "../predict-core" }
+predict-llm = { path = "../predict-llm" }
 thiserror = "2"
 
 [dev-dependencies]

@@ -10,5 +10,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 predict-core = { path = "../predict-core" }
+predict-llm = { path = "../predict-llm" }
 predict-ngram = { path = "../predict-ngram" }
 predict-proto = { path = "../predict-proto" }
