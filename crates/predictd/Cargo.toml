@@ -1,0 +1,14 @@
+[package]
+name = "predictd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "predictd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+predict-core = { path = "../predict-core" }
+predict-ngram = { path = "../predict-ngram" }
+predict-proto = { path = "../predict-proto" }

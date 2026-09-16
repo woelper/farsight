@@ -1,0 +1,13 @@
+[package]
+name = "predict-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "predict-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+predict-proto = { path = "../predict-proto" }

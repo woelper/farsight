@@ -1,0 +1,13 @@
+[package]
+name = "frontend-ibus"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "frontend-ibus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+predict-core = { path = "../predict-core" }
+predict-proto = { path = "../predict-proto" }

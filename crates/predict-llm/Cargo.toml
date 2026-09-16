@@ -1,0 +1,8 @@
+[package]
+name = "predict-llm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+predict-core = { path = "../predict-core" }
+thiserror = "2"

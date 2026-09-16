@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/predict-core",
+    "crates/predict-ngram",
+    "crates/predict-llm",
+    "crates/predict-store",
+    "crates/predict-proto",
+    "crates/predict-eval",
+    "crates/predictd",
+    "crates/predict-cli",
+    "crates/frontend-ibus",
+]
+resolver = "2"
