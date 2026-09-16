@@ -2,6 +2,14 @@
 
 All notable changes to `predict` are documented here, per milestone.
 
+## [Unreleased]
+
+- `predict-cli` overhaul: bordered TUI (title, grey ghost sentence,
+  highlighted top word, status line with word RTT, dimmed history/footer,
+  width fitting), sentence prediction on every keystroke by default
+  (`--no-sentence` opts out, `--help` documents keys), `--no-sentence`
+  flag, pure `draw_frame` covered by tests. See `docs/adr/0005-cli-overhaul.md`.
+
 ## [0.4.0] — M3 slow tier (local LLM)
 
 - `predict-llm`: sync `Backend` trait (`complete_sentence` + `CancelToken`),

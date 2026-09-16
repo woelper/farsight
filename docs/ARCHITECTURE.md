@@ -62,12 +62,14 @@ No network code in any crate (non-negotiable).
   against the optional LLM backend (config `~/.config/predict/predictd.toml`);
   replies only while the generation is current. Serves the embedded
   sample-corpus n-gram model until M4.
-- **predict-cli**: terminal test client (M2 done, sentence UI M3 done,
-  `crossterm`). Live word suggestions per keystroke, Tab accepts the top
-  word, Enter commits, Esc quits. After a 200 ms pause it requests a
-  sentence continuation, shown grey inline, Ctrl+Right accepts. Reads use
-  deadlines and discard foreign frames — a slow daemon never stalls typing.
-  Later: style display.
+- **predict-cli**: terminal test client (`crossterm`; M2 done, sentence UI
+  M3 done, overhauled post-M3 — see ADR 0005). Bordered TUI: grey ghost
+  sentence, highlighted top word, status line with word RTT, dimmed history.
+  Live word suggestions per keystroke, Tab accepts the top word, Enter
+  commits, Esc quits. Sentence prediction runs on every keystroke by default
+  (`--no-sentence` opts out), shown grey inline, Ctrl+Right accepts. Reads
+  use deadlines and discard foreign frames — a slow daemon never stalls
+  typing. Later: style display.
 - **frontend-ibus**: IBus engine in Rust over D-Bus (`zbus`) (M6). Surrounding
   text → `ContextUpdate`; preedit / lookup-table rendering; sensitive content
   types → no suggestions, no learning; 10 ms daemon timeout, never blocks typing.

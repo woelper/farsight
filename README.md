@@ -47,8 +47,9 @@ cargo run -p predict-eval --example eval_sentence -- <model.gguf> [threshold]
 ./scripts/start.sh --stop         # stop the daemon
 # manual equivalent:
 ./target/debug/predictd &          # start the per-user daemon
-./target/debug/predict-cli         # type; Tab accepts word, pause for grey
-                                   # sentence, Ctrl+Right accepts it, Esc quits
+./target/debug/predict-cli         # type; Tab accepts word, grey sentence
+                                   # follows as you type, Ctrl+Right accepts
+                                   # it, Esc quits (flags: --no-sentence)
 ```
 
 To enable the slow tier, place a GGUF model (e.g. Qwen2.5-1.5B base Q4_K_M)
