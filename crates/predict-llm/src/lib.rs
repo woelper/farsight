@@ -39,6 +39,16 @@ impl CancelToken {
     }
 }
 
+/// Stop criterion for generation (length policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopMode {
+    /// Stop at sentence end (`. ! ?`), newline, or cap.
+    #[default]
+    Sentence,
+    /// Stop at clause end (`, ; :` or sentence end), newline, or cap.
+    Clause,
+}
+
 /// One sentence-continuation request.
 #[derive(Debug, Clone)]
 pub struct SentenceRequest {
@@ -48,6 +58,10 @@ pub struct SentenceRequest {
     pub max_tokens: usize,
     /// Minimum mean token logprob for the output to be returned.
     pub confidence_threshold: f32,
+    /// Stop criterion (length policy).
+    pub stop: StopMode,
+    /// Address-form decoding bans (du/Sie); `None` disables.
+    pub address: predict_core::AddressForm,
 }
 
 /// A suggestion produced by the slow tier.
@@ -121,7 +135,7 @@ impl Default for LlmConfig {
             enabled: false,
             model_path: String::new(),
             max_tokens: 32,
-            confidence_threshold: -1.0,
+            confidence_threshold: -1.5,
             n_ctx: 2048,
             n_threads: 0,
         }
@@ -226,6 +240,24 @@ fn strip_leading_blank(piece: &[u8]) -> &[u8] {
         return &piece[ulower.len()..];
     }
     piece
+}
+
+/// Build a retrieval-grounded prompt: the user's own past snippets as
+/// context, then the live text to continue. Empty snippets leave `before`
+/// untouched (byte-identical, so caches keep hitting).
+pub fn build_grounded_prompt(before: &str, snippets: &[String]) -> String {
+    if snippets.is_empty() {
+        return before.to_string();
+    }
+    let mut prompt = String::from("Related notes from your writing:\n");
+    for snippet in snippets {
+        prompt.push_str("- ");
+        prompt.push_str(snippet);
+        prompt.push('\n');
+    }
+    prompt.push_str("---\n");
+    prompt.push_str(before);
+    prompt
 }
 
 /// Deterministic stub backend for tests and harness development.
@@ -335,6 +367,8 @@ mod tests {
             before: before.to_string(),
             max_tokens: 32,
             confidence_threshold: threshold,
+            stop: StopMode::Sentence,
+            address: predict_core::AddressForm::None,
         }
     }
 
@@ -355,6 +389,18 @@ mod tests {
             .complete_sentence(&req("the quick ", -1.5), &CancelToken::new())
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn grounded_prompt_prefixes_snippets() {
+        assert_eq!(build_grounded_prompt("hello", &[]), "hello");
+        let grounded = build_grounded_prompt(
+            "hello",
+            &["hello world".to_string(), "hi".to_string()],
+        );
+        assert!(grounded.ends_with("hello"));
+        assert!(grounded.contains("hello world"));
+        assert!(grounded.contains("Related notes"));
     }
 
     #[test]

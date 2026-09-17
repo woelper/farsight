@@ -10,3 +10,4 @@ thiserror = "2"
 
 [dev-dependencies]
 predict-ngram = { path = "../predict-ngram" }
+predict-store = { path = "../predict-store" }

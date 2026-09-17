@@ -42,6 +42,7 @@ cargo run -p predict-eval --example eval_sentence -- <model.gguf> [threshold]
 ## Try it
 
 ```sh
+./scripts/setup-model.sh          # one-time: download LLM (~941 MB) + write config
 ./scripts/start.sh                # build, start daemon, launch CLI (needs a terminal)
 ./scripts/start.sh --daemon-only  # daemon only; test with ./target/debug/predict-cli
 ./scripts/start.sh --stop         # stop the daemon
@@ -49,23 +50,32 @@ cargo run -p predict-eval --example eval_sentence -- <model.gguf> [threshold]
 ./target/debug/predictd &          # start the per-user daemon
 ./target/debug/predict-cli         # type; Tab accepts word, grey sentence
                                    # follows as you type, Ctrl+Right accepts
-                                   # it, Esc quits (flags: --no-sentence)
+                                   # it, Enter commits, Ctrl+P pauses learning,
+                                   # Ctrl+F twice forgets all, Esc quits
 ```
 
-To enable the slow tier, place a GGUF model (e.g. Qwen2.5-1.5B base Q4_K_M)
-at a known path and write `~/.config/predict/predictd.toml`:
+Without `setup-model.sh` there are no sentence suggestions — `start.sh`
+says so on startup. The generated config (`~/.config/predict/predictd.toml`):
 
 ```toml
 [llm]
 enabled = true
 model_path = "/path/to/qwen2.5-1.5b-q4_k_m.gguf"
 max_tokens = 32
-confidence_threshold = -1.0
+confidence_threshold = -1.5
+
+[personal]
+enabled = true   # learning on by default; Ctrl+P pauses at runtime
+lambda = 0.7     # p = lambda * p_base + (1 - lambda) * p_personal
+db_path = ""     # empty = XDG data default (~/.local/share/predict/predict.db)
 ```
 
 ## Status
 
-M3 done — slow LLM tier works end to end: pause for a grey sentence
-suggestion, Ctrl+Right accepts; eval shows +49 keystrokes over the word
-tier (savings 0.755 vs 0.722, TTFT p50 ~160 ms).
-Store, style, IBus still placeholders.
+M6 done — prediction works in every IBus app: `frontend-ibus` activates
+through the daemon, ghost continuations render inline, `Tab` accepts,
+password/terminal fields stay silent, typing never stalls. Install:
+`docs/INSTALL-linux.md`. M5 done — style-aware prediction (default/du/sie
+builtins, per-app + sticky resolution, word filtering, LLM logit-bias and
+stop control, style-cycled CLI, zero violations on the style eval).
+Novel generalization numbers: `docs/NOVEL-EVAL.md`.

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- IBus component definition for predict (see docs/INSTALL-linux.md).
+     Install to ~/.local/share/ibus/component/ (user) or
+     /usr/share/ibus/component/ (system), then `ibus restart`. -->
+<component>
+    <name>org.freedesktop.IBus.Predict</name>
+    <description>Local word and sentence prediction (predictd)</description>
+    <exec>/usr/local/bin/frontend-ibus --ibus</exec>
+    <version>0.7.0</version>
+    <author>predict contributors</author>
+    <license>MIT</license>
+    <homepage>https://github.com/woelper/farsight</homepage>
+    <textdomain>predict</textdomain>
+    <engines>
+        <engine>
+            <name>predict</name>
+            <language>en</language>
+            <license>MIT</license>
+            <author>predict contributors</author>
+            <layout>default</layout>
+            <longname>Predict</longname>
+            <description>Local word and sentence prediction</description>
+            <icon>input-keyboard</icon>
+            <rank>99</rank>
+        </engine>
+    </engines>
+</component>

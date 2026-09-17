@@ -12,8 +12,8 @@
 //!   where top-1 equals the target word costs `k + 1` keystrokes
 //!   (prefix + one accept key) instead of the full word length.
 
-use predict_core::{Context, Predictor, ResolvedStyle};
-use predict_llm::{Backend, CancelToken, SentenceRequest};
+use predict_core::{Context, LengthMode, Predictor, ResolvedStyle, violates};
+use predict_llm::{Backend, CancelToken, SentenceRequest, StopMode, build_grounded_prompt};
 use std::fmt;
 use std::path::Path;
 use std::time::Instant;
@@ -144,23 +144,10 @@ fn percentile_ms(latencies_us: &[u64], pct: f64) -> f64 {
     sorted[idx] as f64 / 1000.0
 }
 
-/// Lowercase alphanumeric word splitter (same rule as the n-gram tier).
+/// Lowercase alphanumeric word splitter (shared rule, see
+/// [`predict_core::tokenize_text`]).
 fn split_words(corpus: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    for c in corpus.chars() {
-        if c.is_alphanumeric() {
-            for lc in c.to_lowercase() {
-                current.push(lc);
-            }
-        } else if !current.is_empty() {
-            words.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        words.push(current);
-    }
-    words
+    predict_core::tokenize_text(corpus)
 }
 
 /// Rebuild `before` text for a query: previous words plus the first `k`
@@ -187,11 +174,15 @@ struct WordSimOutcome {
 /// Simulate typing one word: one `complete_word` query per prefix length
 /// (`k = 0` is the word boundary). Shared by [`evaluate`] and
 /// [`evaluate_combined`] so both agree on word-tier semantics.
+///
+/// `make_before` builds the `before` text for a prefix: plain history in
+/// [`evaluate`], sentence-terminated history in [`evaluate_combined`] (the
+/// model tokenizes both identically, but routing sees the boundaries).
 fn simulate_word(
     predictor: &dyn Predictor,
-    prev: &[String],
     target: &str,
     latencies_us: &mut Vec<u64>,
+    make_before: impl Fn(&str) -> String,
 ) -> WordSimOutcome {
     let target_chars: Vec<char> = target.chars().collect();
     let mut outcome = WordSimOutcome {
@@ -203,7 +194,7 @@ fn simulate_word(
     };
     for k in 0..target_chars.len() {
         let prefix: String = target_chars[..k].iter().collect();
-        let before = build_before(prev, &prefix);
+        let before = make_before(&prefix);
         let ctx = Context::new("eval", before, "", false, ResolvedStyle::default_style());
 
         let start = Instant::now();
@@ -248,7 +239,12 @@ pub fn evaluate(predictor: &impl Predictor, corpus: &str) -> Result<EvalMetrics,
 
     for (idx, target) in words.iter().enumerate() {
         let prev: Vec<String> = words[..idx].to_vec();
-        let outcome = simulate_word(dyn_predictor, &prev, target, &mut metrics.latencies_us);
+        let outcome = simulate_word(
+            dyn_predictor,
+            target,
+            &mut metrics.latencies_us,
+            |prefix| build_before(&prev, prefix),
+        );
         metrics.queries += outcome.queries;
         metrics.top1_hits += outcome.top1_hits;
         metrics.top3_hits += outcome.top3_hits;
@@ -289,7 +285,7 @@ impl Default for SentenceEvalOpts {
         Self {
             trigger_words: 3,
             max_tokens: 32,
-            confidence_threshold: -1.0,
+            confidence_threshold: -1.5,
             max_triggers: None,
         }
     }
@@ -314,6 +310,9 @@ pub struct SentenceTierReport {
     pub accept_keys: usize,
     /// Shown suggestions matching nothing.
     pub wrong: usize,
+    /// Shown suggestions containing an address-form violation (expect 0:
+    /// both tiers filter; this is the regression alarm).
+    pub violations: usize,
     /// Time to first token per call, microseconds.
     pub ttft_us: Vec<u64>,
 }
@@ -376,6 +375,7 @@ impl fmt::Display for SentenceTierReport {
             self.wrong,
             self.shown
         )?;
+        writeln!(f, "violations:           {}", self.violations)?;
         writeln!(
             f,
             "accepted:           {} words / {} chars ({} accept keys)",
@@ -449,7 +449,7 @@ impl fmt::Display for CombinedReport {
 }
 
 /// Split a corpus into sentences on `.`, `!`, `?`, and newlines.
-fn split_sentences(corpus: &str) -> Vec<String> {
+pub fn split_sentences(corpus: &str) -> Vec<String> {
     corpus
         .split(['.', '!', '?', '\n'])
         .map(str::trim)
@@ -467,23 +467,80 @@ fn common_word_prefix_len(generated: &[String], actual: &[String]) -> usize {
         .count()
 }
 
+/// Snippet fetcher for retrieval grounding: prompt context in, top
+/// matching texts out.
+pub type Retriever<'a> = &'a dyn Fn(&str) -> Vec<String>;
+
+/// Word-tier wrapper applying the daemon's address ban filter, so eval
+/// top-1/top-3 reflect production suggestions.
+struct StyledPredictor<'a> {
+    inner: &'a dyn Predictor,
+    form: predict_core::AddressForm,
+}
+
+impl Predictor for StyledPredictor<'_> {
+    fn complete_word(&self, ctx: &Context) -> Vec<predict_core::Candidate> {
+        self.inner
+            .complete_word(ctx)
+            .into_iter()
+            .filter(|c| !violates(&c.text, self.form))
+            .collect()
+    }
+}
+
 /// Replay `corpus` with the word tier, triggering the slow tier once per
 /// sentence after [`SentenceEvalOpts::trigger_words`] words.
+///
+/// When `retrieval` is given, its snippets ground each slow-tier prompt
+/// (personalized run); `None` reproduces the M3 ungrounded behavior.
+/// When `style` is given, word candidates are filtered and slow requests
+/// carry its address/stop policy (mirroring the daemon); `None` disables
+/// both, reproducing pre-M5 behavior.
 pub fn evaluate_combined(
     word: &dyn Predictor,
     llm: &dyn Backend,
     corpus: &str,
     opts: &SentenceEvalOpts,
+    retrieval: Option<Retriever<'_>>,
+    style: Option<&ResolvedStyle>,
 ) -> Result<CombinedReport, EvalError> {
     let sentences = split_sentences(corpus);
     if sentences.iter().all(|s| split_words(s).is_empty()) {
         return Err(EvalError::EmptyCorpus);
     }
+    // Mirror the daemon's word-tier ban filter so the measured top-1/top-3
+    // reflect production suggestions.
+    let styled;
+    let word: &dyn Predictor = match style {
+        Some(resolved) if resolved.address_form != predict_core::AddressForm::None => {
+            styled = StyledPredictor {
+                inner: word,
+                form: resolved.address_form,
+            };
+            &styled
+        }
+        _ => word,
+    };
+    let (stop, address) = match style {
+        Some(resolved) => (
+            match resolved.length {
+                LengthMode::Phrase => StopMode::Clause,
+                _ => StopMode::Sentence,
+            },
+            resolved.address_form,
+        ),
+        None => (StopMode::Sentence, predict_core::AddressForm::None),
+    };
+    let slow_tier_off = matches!(style.map(|s| s.length), Some(LengthMode::Word));
     let mut report = CombinedReport::default();
     // Global word history across sentences: mirrors evaluate()'s full-text
     // history so word-tier semantics (and the baseline comparison) agree.
     // Consumed words stay in history — the text exists either way.
     let mut history: Vec<String> = Vec::new();
+    // Same history with sentence terminators (finished sentences end with
+    // ". "): the model tokenizes both forms identically, but routing and
+    // retrieval see sentence boundaries exactly like production text.
+    let mut history_dots = String::new();
 
     for sentence in &sentences {
         let words = split_words(sentence);
@@ -496,17 +553,27 @@ pub fn evaluate_combined(
         let mut idx = 0;
         while idx < words.len() {
             let under_cap = opts.max_triggers.is_none_or(|m| report.sentence.triggers < m);
-            if idx == opts.trigger_words && under_cap {
-                let before = history
-                    .iter()
-                    .chain(words[..idx].iter())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            if idx == opts.trigger_words && under_cap && !slow_tier_off {
+                let current = words[..idx].join(" ");
+                let before = if history_dots.is_empty() && current.is_empty() {
+                    String::new()
+                } else if history_dots.is_empty() {
+                    current.clone()
+                } else if current.is_empty() {
+                    history_dots.clone()
+                } else {
+                    format!("{history_dots}{current}")
+                };
+                let grounded = match retrieval {
+                    Some(fetch) => build_grounded_prompt(&before, &fetch(&before)),
+                    None => before,
+                };
                 let req = SentenceRequest {
-                    before,
+                    before: grounded,
                     max_tokens: opts.max_tokens,
                     confidence_threshold: opts.confidence_threshold,
+                    stop,
+                    address,
                 };
                 let output = llm
                     .complete_sentence(&req, &CancelToken::new())
@@ -514,27 +581,49 @@ pub fn evaluate_combined(
                 report.sentence.triggers += 1;
                 if let Some(out) = output {
                     report.sentence.shown += 1;
-                    report
-                        .sentence
-                        .ttft_us
-                        .push(out.time_to_first_token.as_micros() as u64);
-                    let generated = split_words(&out.text);
-                    let matched = common_word_prefix_len(&generated, &words[idx..]);
-                    if matched >= 1 {
-                        let accepted = words[idx..idx + matched].join(" ");
-                        report.sentence.accepted_sentences += 1;
-                        report.sentence.accepted_words += matched;
-                        report.sentence.accepted_chars += accepted.chars().count();
-                        report.sentence.accept_keys += 1;
-                        idx += matched;
-                        continue;
+                    if violates(&out.text, address) {
+                        // Regression alarm: both tiers must filter these.
+                        report.sentence.violations += 1;
+                    } else {
+                        report.sentence.ttft_us
+                            .push(out.time_to_first_token.as_micros() as u64);
+                        let generated = split_words(&out.text);
+                        let matched = common_word_prefix_len(&generated, &words[idx..]);
+                        if matched >= 1 {
+                            let accepted = words[idx..idx + matched].join(" ");
+                            report.sentence.accepted_sentences += 1;
+                            report.sentence.accepted_words += matched;
+                            report.sentence.accepted_chars += accepted.chars().count();
+                            report.sentence.accept_keys += 1;
+                            idx += matched;
+                            continue;
+                        }
+                        report.sentence.wrong += 1;
                     }
-                    report.sentence.wrong += 1;
                 }
             }
-            let mut prev = history.clone();
-            prev.extend_from_slice(&words[..idx]);
-            let outcome = simulate_word(word, &prev, &words[idx], &mut report.word.latencies_us);
+            let current = words[..idx].join(" ");
+            let base = if history_dots.is_empty() {
+                current
+            } else if current.is_empty() {
+                history_dots.clone()
+            } else {
+                format!("{history_dots}{current}")
+            };
+            let outcome = simulate_word(
+                word,
+                &words[idx],
+                &mut report.word.latencies_us,
+                |prefix| {
+                    // Mirror build_before exactly (including its trailing
+                    // space at word boundaries — it selects the code path).
+                    if base.is_empty() {
+                        prefix.to_string()
+                    } else {
+                        format!("{base} {prefix}")
+                    }
+                },
+            );
             report.word.total_words += 1;
             report.word.queries += outcome.queries;
             report.word.top1_hits += outcome.top1_hits;
@@ -543,10 +632,104 @@ pub fn evaluate_combined(
             report.word.keystrokes_with_prediction += word_cost(&outcome);
             idx += 1;
         }
+        let joined = words.join(" ");
         history.extend(words);
+        history_dots.push_str(&joined);
+        history_dots.push_str(". ");
     }
 
     Ok(report)
+}
+
+/// Temporal-split eval (M4): test personal machinery on held-out text.
+///
+/// - `base_word`: word tier trained on the train split only (M3 system).
+/// - `personal_word`: word tier with personal counts (M4 system).
+/// - `retrieval`: snippet fetcher for the personal run (`None` disables
+///   grounding; the baseline always runs ungrounded, as M3 shipped).
+///
+/// Both runs share the slow tier and options; only the personal machinery
+/// differs, so [`TemporalReport::saved_vs_baseline`] isolates its value.
+/// Split the corpus with [`temporal_split`] and learn the train half first
+/// (commit its sentences to the store, then build the blended predictor).
+#[derive(Debug, Default, Clone)]
+pub struct TemporalReport {
+    /// M3-equivalent system on the held-out split (no personal data).
+    pub baseline: CombinedReport,
+    /// M4 system on the held-out split (personal counts + retrieval).
+    pub personal: CombinedReport,
+    /// Held-out words.
+    pub test_words: usize,
+}
+
+impl TemporalReport {
+    /// Extra keystrokes saved by the personal machinery on held-out text.
+    /// Positive means it helped (the M4 done-criterion).
+    pub fn saved_vs_baseline(&self) -> i64 {
+        self.baseline.keystrokes_with_prediction() as i64
+            - self.personal.keystrokes_with_prediction() as i64
+    }
+}
+
+impl fmt::Display for TemporalReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "held-out words:       {}", self.test_words)?;
+        writeln!(
+            f,
+            "baseline (M3-equiv):  {} keystrokes (savings {:.3})",
+            self.baseline.keystrokes_with_prediction(),
+            self.baseline.savings_rate()
+        )?;
+        writeln!(
+            f,
+            "personal (M4):        {} keystrokes (savings {:.3})",
+            self.personal.keystrokes_with_prediction(),
+            self.personal.savings_rate()
+        )?;
+        write!(
+            f,
+            "personal delta:       {:+} keystrokes",
+            self.saved_vs_baseline()
+        )
+    }
+}
+
+/// Split a corpus into train/test text at `train_frac` (0..1, exclusive)
+/// of its words. Returns `(train_text, test_text)`.
+pub fn temporal_split(corpus: &str, train_frac: f64) -> Result<(String, String), EvalError> {
+    if !(train_frac > 0.0 && train_frac < 1.0) {
+        return Err(EvalError::Llm(format!(
+            "train_frac {train_frac} not in (0, 1)"
+        )));
+    }
+    let words = split_words(corpus);
+    if words.is_empty() {
+        return Err(EvalError::EmptyCorpus);
+    }
+    let cut = ((words.len() as f64 * train_frac).round() as usize).clamp(1, words.len() - 1);
+    Ok((words[..cut].join(" "), words[cut..].join(" ")))
+}
+
+/// Replay held-out `test_text` with both systems (see [`TemporalReport`]).
+pub fn evaluate_temporal(
+    base_word: &dyn Predictor,
+    personal_word: &dyn Predictor,
+    llm: &dyn Backend,
+    test_text: &str,
+    opts: &SentenceEvalOpts,
+    retrieval: Option<Retriever<'_>>,
+    style: Option<&ResolvedStyle>,
+) -> Result<TemporalReport, EvalError> {
+    if split_words(test_text).is_empty() {
+        return Err(EvalError::EmptyCorpus);
+    }
+    let baseline = evaluate_combined(base_word, llm, test_text, opts, None, style)?;
+    let personal = evaluate_combined(personal_word, llm, test_text, opts, retrieval, style)?;
+    Ok(TemporalReport {
+        test_words: split_words(test_text).len(),
+        baseline,
+        personal,
+    })
 }
 
 #[cfg(test)]
@@ -671,7 +854,7 @@ mod tests {
     fn combined_rejects_empty_corpus() {
         let word = FixedPredictor { candidates: vec![] };
         let llm = predict_llm::StubBackend::empty();
-        let err = evaluate_combined(&word, &llm, "  ...  ", &sentence_opts()).unwrap_err();
+        let err = evaluate_combined(&word, &llm, "  ...  ", &sentence_opts(), None, None).unwrap_err();
         assert!(matches!(err, EvalError::EmptyCorpus));
     }
 
@@ -683,7 +866,7 @@ mod tests {
         let llm = predict_llm::StubBackend::fixed("dd ee", -0.1);
         let corpus = "aa bb cc dd ee. aa bb cc dd ee.";
         let baseline = evaluate(&word, corpus).unwrap();
-        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts()).unwrap();
+        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts(), None, None).unwrap();
         assert_eq!(combined.sentence.sentences, 2);
         assert_eq!(combined.sentence.triggers, 2);
         assert_eq!(combined.sentence.shown, 2);
@@ -707,7 +890,7 @@ mod tests {
         let llm = predict_llm::StubBackend::empty();
         let corpus = "aa bb cc dd ee. aa bb cc dd ee.";
         let baseline = evaluate(&word, corpus).unwrap();
-        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts()).unwrap();
+        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts(), None, None).unwrap();
         assert_eq!(combined.sentence.triggers, 2);
         assert_eq!(combined.sentence.shown, 0);
         assert_eq!(
@@ -723,7 +906,7 @@ mod tests {
         let llm = predict_llm::StubBackend::fixed("zzz qqq", -0.1);
         let corpus = "aa bb cc dd ee.";
         let baseline = evaluate(&word, corpus).unwrap();
-        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts()).unwrap();
+        let combined = evaluate_combined(&word, &llm, corpus, &sentence_opts(), None, None).unwrap();
         assert_eq!(combined.sentence.shown, 1);
         assert_eq!(combined.sentence.accepted_sentences, 0);
         assert_eq!(combined.sentence.wrong, 1);
@@ -738,10 +921,167 @@ mod tests {
         let corpus = "aa bb cc dd ee. aa bb cc dd ee. aa bb cc dd ee.";
         let mut opts = sentence_opts();
         opts.max_triggers = Some(1);
-        let combined = evaluate_combined(&word, &llm, corpus, &opts).unwrap();
+        let combined = evaluate_combined(&word, &llm, corpus, &opts, None, None).unwrap();
         assert_eq!(combined.sentence.triggers, 1);
         assert_eq!(combined.sentence.accepted_sentences, 1);
         // Word tier still simulates every non-consumed word.
         assert_eq!(combined.word.total_words, 15 - 2);
+    }
+
+    #[test]
+    fn retrieval_hook_receives_trigger_context() {
+        use std::cell::RefCell;
+        let seen: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let retrieval = |before: &str| {
+            seen.borrow_mut().push(before.to_string());
+            Vec::new()
+        };
+        let word = FixedPredictor { candidates: vec![] };
+        let llm = predict_llm::StubBackend::empty();
+        evaluate_combined(&word, &llm, "aa bb cc dd ee ff.", &sentence_opts(), Some(&retrieval), None)
+            .unwrap();
+        assert_eq!(*seen.borrow(), vec!["aa bb cc".to_string()]);
+    }
+
+    #[test]
+    fn temporal_split_cuts_by_words() {
+        let (train, test) = temporal_split("aa bb cc dd ee ff gg hh", 0.75).unwrap();
+        assert_eq!(train, "aa bb cc dd ee ff");
+        assert_eq!(test, "gg hh");
+        assert!(temporal_split("aa bb", 0.0).is_err());
+        assert!(temporal_split("aa bb", 1.0).is_err());
+        assert!(temporal_split(" ... ", 0.75).is_err());
+    }
+
+    #[test]
+    fn temporal_personal_beats_base_on_held_out() {
+        use predict_ngram::{LangBlended, NgramModel, PersonalBundle, PersonalCounts};
+        let base = NgramModel::from_text("the quick brown fox jumps").unwrap();
+        let empty_base = NgramModel::new();
+        let mut counts = PersonalCounts::new();
+        counts.add_text("aa bb cc target word");
+        let bundle = PersonalBundle {
+            en: counts,
+            de: PersonalCounts::new(),
+        };
+        let blended = LangBlended::new(&base, &empty_base, &bundle, 0.5);
+        let llm = predict_llm::StubBackend::empty();
+        // Test split reuses the personal vocabulary (train split omitted:
+        // the bundle stands in for learned train text here).
+        let report =
+            evaluate_temporal(&base, &blended, &llm, "target word here now", &sentence_opts(), None, None)
+                .unwrap();
+        assert_eq!(report.test_words, 4);
+        assert_eq!(report.saved_vs_baseline(), 7);
+        assert!(evaluate_temporal(&base, &blended, &llm, " ... ", &sentence_opts(), None, None).is_err());
+    }
+
+    #[test]
+    fn temporal_empty_personal_matches_baseline() {
+        use predict_ngram::{LangBlended, NgramModel, PersonalBundle};
+        let base = NgramModel::from_text("the quick brown fox jumps").unwrap();
+        let bundle = PersonalBundle::default();
+        let blended = LangBlended::new(&base, &base, &bundle, 0.5);
+        let llm = predict_llm::StubBackend::empty();
+        let report = evaluate_temporal(
+            &base,
+            &blended,
+            &llm,
+            "the quick brown fox jumps",
+            &sentence_opts(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.saved_vs_baseline(), 0);
+    }
+
+    /// Full M4 path with a real store: train split committed, bundle
+    /// reloaded, temporal delta measured — all in memory.
+    #[test]
+    fn temporal_store_backed_end_to_end() {
+        use predict_ngram::{LangBlended, NgramModel, PersonalBundle};
+        use predict_store::Store;
+        let base = NgramModel::from_text("the quick brown fox jumps").unwrap();
+        let corpus = "aa bb cc target word see. aa bb cc target word see. aa bb cc target word see.";
+        let (train_text, test_text) = temporal_split(corpus, 0.66).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        // Production commits per settled line; the harness-level test
+        // commits the whole train split as one document (boundary bigrams
+        // differ, counts are equivalent otherwise).
+        assert!(store.commit(&train_text, "default").unwrap());
+        let bundle = PersonalBundle {
+            en: store
+                .personal_counts(predict_ngram::Language::En, None)
+                .unwrap(),
+            de: store
+                .personal_counts(predict_ngram::Language::De, None)
+                .unwrap(),
+        };
+        let blended = LangBlended::new(&base, &base, &bundle, 0.5);
+        let llm = predict_llm::StubBackend::empty();
+        let report =
+            evaluate_temporal(&base, &blended, &llm, &test_text, &sentence_opts(), None, None).unwrap();
+        assert_eq!(report.test_words, 6);
+        assert!(
+            report.saved_vs_baseline() > 0,
+            "no personal gain: {report:?}"
+        );
+    }
+
+    fn sie_style() -> ResolvedStyle {
+        ResolvedStyle {
+            style_id: "sie".to_string(),
+            address_form: predict_core::AddressForm::Sie,
+            length: predict_core::LengthMode::Sentence,
+        }
+    }
+
+    #[test]
+    fn combined_style_filters_du_words() {
+        let word = FixedPredictor {
+            candidates: vec![Candidate::new("du", 1.0)],
+        };
+        let llm = predict_llm::StubBackend::empty();
+        let plain = evaluate_combined(&word, &llm, "du", &sentence_opts(), None, None).unwrap();
+        assert_eq!(plain.word.top1_hits, 2); // "" and "d" prefixes hit
+        let styled =
+            evaluate_combined(&word, &llm, "du", &sentence_opts(), None, Some(&sie_style()))
+                .unwrap();
+        assert_eq!(styled.word.top1_hits, 0);
+        assert_eq!(styled.word.top3_hits, 0);
+    }
+
+    #[test]
+    fn combined_counts_violations() {
+        let word = FixedPredictor { candidates: vec![] };
+        let llm = predict_llm::StubBackend::fixed("du bist willkommen", -0.1);
+        let report = evaluate_combined(
+            &word,
+            &llm,
+            "aa bb cc dd ee.",
+            &sentence_opts(),
+            None,
+            Some(&sie_style()),
+        )
+        .unwrap();
+        assert_eq!(report.sentence.shown, 1);
+        assert_eq!(report.sentence.violations, 1);
+        assert_eq!(report.sentence.accepted_sentences, 0);
+    }
+
+    #[test]
+    fn combined_word_length_skips_slow_tier() {
+        let word = FixedPredictor { candidates: vec![] };
+        let llm = predict_llm::StubBackend::fixed("dd ee", -0.1);
+        let style = ResolvedStyle {
+            style_id: "wordy".to_string(),
+            address_form: predict_core::AddressForm::None,
+            length: predict_core::LengthMode::Word,
+        };
+        let report = evaluate_combined(&word, &llm, "aa bb cc dd ee.", &sentence_opts(), None, Some(&style))
+            .unwrap();
+        assert_eq!(report.sentence.triggers, 0);
+        assert_eq!(report.sentence.shown, 0);
     }
 }

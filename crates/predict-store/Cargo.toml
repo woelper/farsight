@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 predict-core = { path = "../predict-core" }
+predict-ngram = { path = "../predict-ngram" }
+rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"

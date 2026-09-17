@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|s| s.parse())
         .transpose()
         .map_err(|e| format!("bad threshold: {e}"))?
-        .unwrap_or(-1.0);
+        .unwrap_or(-1.5);
 
     let word_model = NgramModel::from_text(CORPUS).map_err(|e| format!("train: {e}"))?;
     let baseline = evaluate(&word_model, CORPUS).map_err(|e| format!("baseline: {e}"))?;
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         confidence_threshold: threshold,
         ..Default::default()
     };
-    let combined = evaluate_combined(&word_model, &llm, CORPUS, &opts)
+    let combined = evaluate_combined(&word_model, &llm, CORPUS, &opts, None, None)
         .map_err(|e| format!("combined: {e}"))?;
     println!("\n=== combined (M3, threshold {threshold}) ===\n{combined}");
     println!(

@@ -43,6 +43,15 @@ if ! grep -q "listening on" "$LOG" 2>/dev/null; then
     exit 1
 fi
 grep "listening on" "$LOG" | tail -1
+# Surface the slow-tier status: without a model there are no sentences,
+# and the daemon log is otherwise invisible behind this script.
+if grep -q "llm enabled" "$LOG" 2>/dev/null; then
+    grep "llm enabled" "$LOG" | tail -1
+else
+    echo "NOTE: slow tier (sentence prediction) is OFF." >&2
+    grep "llm disabled" "$LOG" 2>/dev/null | tail -1 >&2 || true
+    echo "      Run ./scripts/setup-model.sh, then restart the daemon." >&2
+fi
 
 if [[ "${1:-}" == "--daemon-only" ]]; then
     echo "daemon running; socket ready."

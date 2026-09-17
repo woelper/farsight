@@ -11,7 +11,7 @@ use thiserror::Error;
 
 /// Protocol version. Any breaking change bumps this; readers reject frames
 /// whose version differs.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Maximum frame payload in bytes (postcard body, excluding length prefix).
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
@@ -86,6 +86,27 @@ pub struct CancelMsg {
     pub generation: u64,
 }
 
+/// Settled text from the frontend (committed after a pause or field leave —
+/// never keystrokes). The daemon stores it unless learning is paused or the
+/// field is sensitive, and answers with [`LearningState`] so frontends can
+/// show live store state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommitText {
+    /// The settled text.
+    pub text: String,
+    /// Active style id (recorded for M5).
+    pub style_id: String,
+    /// Sensitive field: must not be stored.
+    pub sensitive: bool,
+}
+
+/// Pause or resume learning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetLearning {
+    /// False pauses learning (commits ignored); true resumes it.
+    pub enabled: bool,
+}
+
 /// Client (frontend) to daemon messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMsg {
@@ -98,6 +119,12 @@ pub enum ClientMsg {
     SuggestSentence(SuggestRequest),
     /// Cancel a generation.
     Cancel(CancelMsg),
+    /// Store settled text (personal memory).
+    CommitText(CommitText),
+    /// Remove all personal data (answered with [`LearningState`]).
+    ForgetAll,
+    /// Pause/resume learning (answered with [`LearningState`]).
+    SetLearning(SetLearning),
 }
 
 /// One suggestion.
@@ -134,6 +161,15 @@ pub struct SentenceSuggestion {
     pub style_id: String,
 }
 
+/// Learning state after [`ClientMsg::ForgetAll`]/[`ClientMsg::SetLearning`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LearningState {
+    /// Learning currently enabled (false while paused).
+    pub enabled: bool,
+    /// Stored documents (0 right after forget-all).
+    pub documents: u64,
+}
+
 /// Daemon to client messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DaemonMsg {
@@ -141,6 +177,8 @@ pub enum DaemonMsg {
     Suggestion(Suggestion),
     /// Sentence continuation for a generation.
     Sentence(SentenceSuggestion),
+    /// Learning state after a control command.
+    LearningState(LearningState),
 }
 
 /// Version envelope around every frame payload.
@@ -219,6 +257,75 @@ pub fn read_daemon_msg(reader: &mut impl Read) -> Result<DaemonMsg, ProtoError> 
     read_envelope(reader)
 }
 
+/// True for read timeouts (no data yet), as opposed to fatal errors.
+/// Note: on Linux an expired socket timeout surfaces as `WouldBlock`.
+pub fn is_timeout(err: &ProtoError) -> bool {
+    matches!(
+        err,
+        ProtoError::Io(e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Read until the word reply for `generation` arrives or `timeout` passes.
+/// Stray messages (stale generations, late sentences) are discarded;
+/// `None` means the daemon didn't answer in time.
+pub fn read_word_reply(
+    stream: &mut std::os::unix::net::UnixStream,
+    generation: u64,
+    timeout: std::time::Duration,
+) -> Result<Option<Suggestion>, ProtoError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(ProtoError::Io)?;
+        match read_daemon_msg(stream) {
+            Ok(DaemonMsg::Suggestion(s)) if s.generation == generation => {
+                return Ok(Some(s));
+            }
+            Ok(_) => {} // stale or sentence: discard, keep waiting
+            Err(e) if is_timeout(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Read until the sentence reply for `generation` arrives or `timeout`
+/// passes. Returns `None` on timeout (still computing, gated, disabled,
+/// or filtered).
+pub fn read_sentence_reply(
+    stream: &mut std::os::unix::net::UnixStream,
+    generation: u64,
+    timeout: std::time::Duration,
+) -> Result<Option<SentenceSuggestion>, ProtoError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(ProtoError::Io)?;
+        match read_daemon_msg(stream) {
+            Ok(DaemonMsg::Sentence(s)) if s.generation == generation && !s.text.is_empty() => {
+                return Ok(Some(s));
+            }
+            Ok(_) => {} // stale or word reply: discard, keep waiting
+            Err(e) if is_timeout(&e) => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +397,25 @@ mod tests {
     }
 
     #[test]
+    fn control_messages_roundtrip() {
+        roundtrip_client(&ClientMsg::CommitText(CommitText {
+            text: "settled line".to_string(),
+            style_id: "default".to_string(),
+            sensitive: false,
+        }));
+        roundtrip_client(&ClientMsg::ForgetAll);
+        roundtrip_client(&ClientMsg::SetLearning(SetLearning { enabled: false }));
+        let msg = DaemonMsg::LearningState(LearningState {
+            enabled: true,
+            documents: 12,
+        });
+        let mut buf = Cursor::new(Vec::new());
+        write_daemon_msg(&mut buf, &msg).unwrap();
+        buf.set_position(0);
+        assert_eq!(read_daemon_msg(&mut buf).unwrap(), msg);
+    }
+
+    #[test]
     fn multiple_frames_share_one_stream() {
         let mut buf = Cursor::new(Vec::new());
         let first = ClientMsg::ContextUpdate(sample_ctx());
@@ -315,10 +441,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                ProtoError::VersionMismatch {
-                    expected: PROTOCOL_VERSION,
-                    got: 3
-                }
+                ProtoError::VersionMismatch { expected, got }
+                if expected == PROTOCOL_VERSION && got == PROTOCOL_VERSION + 1
             ),
             "unexpected error: {err:?}"
         );
@@ -360,5 +484,78 @@ mod tests {
             name == "predictd.sock" || name.starts_with("predictd-"),
             "unexpected socket name: {name}"
         );
+    }
+
+    fn word_msg(gen: u64, word: &str) -> DaemonMsg {
+        DaemonMsg::Suggestion(Suggestion {
+            generation: gen,
+            candidates: vec![ProtoCandidate {
+                text: word.to_string(),
+                score: 1.0,
+            }],
+            style_id: "default".to_string(),
+        })
+    }
+
+    fn sentence_msg(gen: u64, text: &str) -> DaemonMsg {
+        DaemonMsg::Sentence(SentenceSuggestion {
+            generation: gen,
+            text: text.to_string(),
+            confidence: -0.5,
+            style_id: "default".to_string(),
+        })
+    }
+
+    #[test]
+    fn word_reader_skips_stray_sentence() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(7, "late")).unwrap();
+        write_daemon_msg(&mut server, &word_msg(9, "world")).unwrap();
+        let reply = read_word_reply(&mut client, 9, std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.generation, 9);
+        assert_eq!(reply.candidates[0].text, "world");
+    }
+
+    #[test]
+    fn word_reader_times_out_to_none() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let reply = read_word_reply(&mut client, 3, std::time::Duration::from_millis(50)).unwrap();
+        assert!(reply.is_none());
+    }
+
+    #[test]
+    fn sentence_reader_skips_stray_suggestion() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        write_daemon_msg(&mut server, &word_msg(9, "world")).unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(9, " wide.")).unwrap();
+        let reply =
+            read_sentence_reply(&mut client, 9, std::time::Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(reply.text, " wide.");
+    }
+
+    #[test]
+    fn sentence_reader_times_out_to_none() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        let reply =
+            read_sentence_reply(&mut client, 3, std::time::Duration::from_millis(50)).unwrap();
+        assert!(reply.is_none());
+    }
+
+    #[test]
+    fn timeout_predicate_covers_socket_timeouts() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, _server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(10)))
+            .unwrap();
+        let err = read_daemon_msg(&mut client).unwrap_err();
+        assert!(is_timeout(&err), "expected timeout, got {err:?}");
+        assert!(!is_timeout(&ProtoError::FrameTooLarge { len: 1 }));
     }
 }

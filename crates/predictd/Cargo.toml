@@ -13,3 +13,6 @@ predict-core = { path = "../predict-core" }
 predict-llm = { path = "../predict-llm" }
 predict-ngram = { path = "../predict-ngram" }
 predict-proto = { path = "../predict-proto" }
+predict-store = { path = "../predict-store" }
+serde = { version = "1", features = ["derive"] }
+toml = "1"

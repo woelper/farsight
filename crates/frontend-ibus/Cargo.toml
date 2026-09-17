@@ -9,5 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-predict-core = { path = "../predict-core" }
 predict-proto = { path = "../predict-proto" }
+serde = { version = "1", features = ["derive"] }
+zbus = "5"

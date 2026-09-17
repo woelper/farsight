@@ -18,8 +18,8 @@ use crossterm::terminal::{
 };
 use crossterm::execute;
 use predict_proto::{
-    CancelMsg, ClientMsg, ContextUpdate, DaemonMsg, ProtoCandidate, ProtoError, SuggestRequest,
-    read_daemon_msg, socket_path, write_client_msg,
+    CancelMsg, ClientMsg, CommitText, ContextUpdate, DaemonMsg, LearningState, ProtoCandidate,
+    SetLearning, SuggestRequest, read_daemon_msg, socket_path, write_client_msg,
 };
 use std::io::{Stdout, Write};
 use std::os::unix::net::UnixStream;
@@ -31,6 +31,8 @@ const WORD_TIMEOUT: Duration = Duration::from_millis(300);
 const PAUSE: Duration = Duration::from_millis(200);
 /// How long an idle cycle waits for a slow-tier reply before polling keys.
 const SENTENCE_TRY: Duration = Duration::from_millis(50);
+/// How long control commands (pause/forget) wait for their reply.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// CLI options (all default-on; flags opt out).
 #[derive(Debug, PartialEq)]
@@ -52,7 +54,10 @@ fn usage() -> &'static str {
      Keys:\n  \
      Tab          accept the top word\n  \
      Ctrl+Right   accept the whole sentence (grey text)\n  \
-     Enter        commit the line\n  \
+     Enter        commit the line (settled text for learning)\n  \
+     Ctrl+S       cycle prediction style (default/du/sie)\n  \
+     Ctrl+P       pause/resume learning\n  \
+     Ctrl+F       forget all personal data (press twice to confirm)\n  \
      Esc / Ctrl+C quit\n\
      \n\
      Sentence prediction runs on every keystroke by default and is\n\
@@ -82,9 +87,15 @@ fn main() -> Result<()> {
     let mut generation: u64 = 0;
     let mut sentence_req: Option<u64> = None;
     let mut sentence: Option<String> = None;
+    // Assumed until the first control reply corrects it.
+    let mut learn_on = true;
+    let mut learn_docs: u64 = 0;
+    let mut forget_armed = false;
+    let mut current_style = "default";
     let (mut state, mut word_rtt_ms) = on_buffer_changed(
         &mut stream,
         &buffer,
+        current_style,
         &mut generation,
         &mut sentence_req,
         &mut sentence,
@@ -102,6 +113,11 @@ fn main() -> Result<()> {
                 enabled: args.sentence_enabled,
             },
             word_rtt_ms,
+            &LearnUi {
+                on: learn_on,
+                docs: learn_docs,
+                forget_armed,
+            },
             &committed,
         ),
     )?;
@@ -115,37 +131,84 @@ fn main() -> Result<()> {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break;
                     }
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        forget_armed = false;
+                        current_style = cycle_style(current_style);
+                        mutated = true;
+                    }
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        forget_armed = false;
+                        if let Some(state) =
+                            toggle_learning(&mut stream, learn_on, generation, &mut sentence)?
+                        {
+                            learn_on = state.enabled;
+                            learn_docs = state.documents;
+                        }
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        forget_armed = !forget_armed;
+                        if !forget_armed {
+                            if let Some(state) = forget_all(
+                                &mut stream,
+                                generation,
+                                &mut sentence,
+                            )? {
+                                learn_docs = state.documents;
+                            }
+                        }
+                    }
                     KeyCode::Char(c) => {
+                        forget_armed = false;
                         buffer.push(c);
                         mutated = true;
                     }
                     KeyCode::Backspace => {
+                        forget_armed = false;
                         buffer.pop();
                         mutated = true;
                     }
                     KeyCode::Tab => {
+                        forget_armed = false;
                         if let Some(top) = state.candidates.first() {
                             buffer = accept_completion(&buffer, &top.text);
                             mutated = true;
                         }
                     }
                     KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        forget_armed = false;
                         if let Some(text) = sentence.take() {
                             buffer = accept_sentence(&buffer, &text);
                             mutated = true;
                         }
                     }
                     KeyCode::Enter => {
-                        committed.push(std::mem::take(&mut buffer));
+                        forget_armed = false;
+                        let done = std::mem::take(&mut buffer);
+                        send_commit(&mut stream, &done)?;
+                        // Commit ack carries live store state (timeout keeps
+                        // the old display; transport errors exit below).
+                        if let Some(state) = read_learning_reply(
+                            &mut stream,
+                            generation,
+                            &mut sentence,
+                            CONTROL_TIMEOUT,
+                        )? {
+                            learn_on = state.enabled;
+                            learn_docs = state.documents;
+                        }
+                        committed.push(done);
                         mutated = true;
                     }
-                    _ => {}
+                    _ => {
+                        forget_armed = false;
+                    }
                 }
             }
             if mutated {
                 let (fresh, rtt) = on_buffer_changed(
                     &mut stream,
                     &buffer,
+                    current_style,
                     &mut generation,
                     &mut sentence_req,
                     &mut sentence,
@@ -158,7 +221,7 @@ fn main() -> Result<()> {
             // Typing pause: collect a sentence reply (requested on the last
             // refresh; re-request defensively if the generation moved on).
             if sentence_req != Some(generation) {
-                request_sentence(&mut stream, &buffer, generation)?;
+                request_sentence(&mut stream, &buffer, current_style, generation)?;
                 sentence_req = Some(generation);
             }
             if let Some(text) = read_sentence_reply(&mut stream, generation, SENTENCE_TRY)? {
@@ -177,6 +240,11 @@ fn main() -> Result<()> {
                     enabled: args.sentence_enabled,
                 },
                 word_rtt_ms,
+                &LearnUi {
+                    on: learn_on,
+                    docs: learn_docs,
+                    forget_armed,
+                },
                 &committed,
             ),
         )?;
@@ -209,16 +277,6 @@ struct SuggestionState {
     style_id: String,
 }
 
-/// True for read timeouts (no data yet), as opposed to fatal errors.
-fn timed_out(err: &ProtoError) -> bool {
-    matches!(
-        err,
-        ProtoError::Io(e)
-            if e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::WouldBlock
-    )
-}
-
 /// Read until the word reply for `generation` arrives or `timeout` passes.
 /// Stray messages (stale generations, late sentences) are discarded.
 fn read_words_reply(
@@ -231,28 +289,14 @@ fn read_words_reply(
         candidates: Vec::new(),
         style_id: "default".to_string(),
     };
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        stream
-            .set_read_timeout(Some(remaining))
-            .context("set read timeout")?;
-        match read_daemon_msg(stream) {
-            Ok(DaemonMsg::Suggestion(s)) if s.generation == generation => {
-                return Ok(SuggestionState {
-                    generation,
-                    candidates: s.candidates,
-                    style_id: s.style_id,
-                });
-            }
-            Ok(_) => {} // stale or sentence: discard, keep waiting
-            Err(e) if timed_out(&e) => {
-                if Instant::now() >= deadline {
-                    return Ok(empty());
-                }
-            }
-            Err(e) => return Err(e).context("read suggestion"),
-        }
+    match predict_proto::read_word_reply(stream, generation, timeout) {
+        Ok(Some(s)) => Ok(SuggestionState {
+            generation,
+            candidates: s.candidates,
+            style_id: s.style_id,
+        }),
+        Ok(None) => Ok(empty()),
+        Err(e) => Err(anyhow::anyhow!(e).context("read suggestion")),
     }
 }
 
@@ -263,25 +307,18 @@ fn read_sentence_reply(
     generation: u64,
     timeout: Duration,
 ) -> Result<Option<String>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        stream
-            .set_read_timeout(Some(remaining))
-            .context("set read timeout")?;
-        match read_daemon_msg(stream) {
-            Ok(DaemonMsg::Sentence(s)) if s.generation == generation && !s.text.is_empty() => {
-                return Ok(Some(s.text));
-            }
-            Ok(_) => {} // stale or word reply: discard, keep waiting
-            Err(e) if timed_out(&e) => {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-            }
-            Err(e) => return Err(e).context("read sentence"),
-        }
+    match predict_proto::read_sentence_reply(stream, generation, timeout) {
+        Ok(Some(s)) => Ok(Some(s.text)),
+        Ok(None) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(e).context("read sentence")),
     }
+}
+
+/// Cycle to the next built-in style id (the daemon always knows these).
+fn cycle_style(current: &str) -> &'static str {
+    let styles = predict_core::BUILTIN_STYLES;
+    let pos = styles.iter().position(|s| *s == current).unwrap_or(0);
+    styles[(pos + 1) % styles.len()]
 }
 
 /// The buffer changed: cancel superseded slow work, bump the generation,
@@ -292,6 +329,7 @@ fn read_sentence_reply(
 fn on_buffer_changed(
     stream: &mut UnixStream,
     buffer: &str,
+    style_id: &str,
     generation: &mut u64,
     sentence_req: &mut Option<u64>,
     sentence: &mut Option<String>,
@@ -304,8 +342,11 @@ fn on_buffer_changed(
     *sentence = None;
     *generation = generation.wrapping_add(1);
     let gen = *generation;
-    write_client_msg(stream, &ClientMsg::ContextUpdate(build_context_update(buffer)))
-        .context("send context")?;
+    write_client_msg(
+        stream,
+        &ClientMsg::ContextUpdate(build_context_update(buffer, style_id)),
+    )
+    .context("send context")?;
     write_client_msg(
         stream,
         &ClientMsg::Suggest(SuggestRequest { generation: gen }),
@@ -315,16 +356,24 @@ fn on_buffer_changed(
     let state = read_words_reply(stream, gen, WORD_TIMEOUT)?;
     let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
     if sentence_enabled && !buffer.is_empty() {
-        request_sentence(stream, buffer, gen)?;
+        request_sentence(stream, buffer, style_id, gen)?;
         *sentence_req = Some(gen);
     }
     Ok((state, rtt_ms))
 }
 
 /// Ask for a sentence continuation for `generation`.
-fn request_sentence(stream: &mut UnixStream, buffer: &str, generation: u64) -> Result<()> {
-    write_client_msg(stream, &ClientMsg::ContextUpdate(build_context_update(buffer)))
-        .context("send context")?;
+fn request_sentence(
+    stream: &mut UnixStream,
+    buffer: &str,
+    style_id: &str,
+    generation: u64,
+) -> Result<()> {
+    write_client_msg(
+        stream,
+        &ClientMsg::ContextUpdate(build_context_update(buffer, style_id)),
+    )
+    .context("send context")?;
     write_client_msg(
         stream,
         &ClientMsg::SuggestSentence(SuggestRequest { generation }),
@@ -333,14 +382,92 @@ fn request_sentence(stream: &mut UnixStream, buffer: &str, generation: u64) -> R
     Ok(())
 }
 
-/// Build the proto context for the current input line.
-fn build_context_update(buffer: &str) -> ContextUpdate {
+/// Build a settled-text commit for a committed line.
+fn build_commit_msg(text: &str) -> ClientMsg {
+    ClientMsg::CommitText(CommitText {
+        text: text.to_string(),
+        style_id: "default".to_string(),
+        sensitive: false,
+    })
+}
+
+/// Send settled text for learning. Write errors propagate (a dead daemon
+/// surfaces on the next refresh at the latest).
+fn send_commit(stream: &mut UnixStream, text: &str) -> Result<()> {
+    write_client_msg(stream, &build_commit_msg(text)).context("send commit")
+}
+
+/// Read until the learning-state reply arrives or `timeout` passes. A fresh
+/// sentence arriving meanwhile is stashed instead of dropped.
+fn read_learning_reply(
+    stream: &mut UnixStream,
+    current_gen: u64,
+    sentence: &mut Option<String>,
+    timeout: Duration,
+) -> Result<Option<LearningState>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        stream
+            .set_read_timeout(Some(remaining))
+            .context("set read timeout")?;
+        match read_daemon_msg(stream) {
+            Ok(DaemonMsg::LearningState(state)) => return Ok(Some(state)),
+            Ok(DaemonMsg::Sentence(s))
+                if s.generation == current_gen && !s.text.is_empty() =>
+            {
+                if sentence.is_none() {
+                    *sentence = Some(s.text);
+                }
+            }
+            Ok(_) => {} // stale: discard, keep waiting
+            Err(e) if predict_proto::is_timeout(&e) => {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+            }
+            Err(e) => return Err(e).context("read learning state"),
+        }
+    }
+}
+
+/// Toggle pause-learning; returns the new state (`None` on timeout, keeping
+/// the old display).
+fn toggle_learning(
+    stream: &mut UnixStream,
+    learn_on: bool,
+    generation: u64,
+    sentence: &mut Option<String>,
+) -> Result<Option<LearningState>> {
+    write_client_msg(
+        stream,
+        &ClientMsg::SetLearning(SetLearning {
+            enabled: !learn_on,
+        }),
+    )
+    .context("send pause toggle")?;
+    read_learning_reply(stream, generation, sentence, CONTROL_TIMEOUT)
+}
+
+/// Forget-all (confirmed by the caller via double-press); returns the new
+/// state (`None` on timeout).
+fn forget_all(
+    stream: &mut UnixStream,
+    generation: u64,
+    sentence: &mut Option<String>,
+) -> Result<Option<LearningState>> {
+    write_client_msg(stream, &ClientMsg::ForgetAll).context("send forget-all")?;
+    read_learning_reply(stream, generation, sentence, CONTROL_TIMEOUT)
+}
+
+/// Build the proto context for the current input line and style.
+fn build_context_update(buffer: &str, style_id: &str) -> ContextUpdate {
     ContextUpdate {
         app_id: "predict-cli".to_string(),
         before: buffer.to_string(),
         after: String::new(),
         sensitive: false,
-        style_id: "default".to_string(),
+        style_id: style_id.to_string(),
     }
 }
 
@@ -378,6 +505,9 @@ struct Frame<'a> {
     style_id: &'a str,
     generation: u64,
     word_rtt_ms: f64,
+    learn_on: bool,
+    learn_docs: u64,
+    forget_armed: bool,
     committed: &'a [String],
 }
 
@@ -466,20 +596,28 @@ fn draw_frame(view: &Frame) -> String {
         lines.push(row);
     }
 
-    // Status line.
+    // Status line (compact segments so it fits narrow terminals).
     let sentence_status = if !view.sentence_enabled {
-        "sentence off"
+        "sent off"
     } else if view.sentence.is_some() {
-        "sentence ready"
+        "sent ready"
     } else if view.sentence_pending {
-        "sentence …"
+        "sent …"
     } else {
-        "no sentence"
+        "no sent"
+    };
+    let learn_status = if view.learn_on {
+        format!("learn on ({})", view.learn_docs)
+    } else {
+        "learn paused".to_string()
     };
     lines.push(
-        format!(
-            "style {} · gen {} · word {:.1}ms · {sentence_status}",
-            view.style_id, view.generation, view.word_rtt_ms,
+        fit_head(
+            &format!(
+                "{} · gen {} · {:.1}ms · {sentence_status} · {learn_status}",
+                view.style_id, view.generation, view.word_rtt_ms,
+            ),
+            width,
         )
         .dim()
         .to_string(),
@@ -499,12 +637,13 @@ fn draw_frame(view: &Frame) -> String {
         lines.push(fit_head(&format!("committed: {line}"), width).dim().to_string());
     }
 
-    // Footer.
-    lines.push(
-        "Tab word · Ctrl+→ sentence · Enter commit · Esc quit"
-            .dim()
-            .to_string(),
-    );
+    // Footer (confirm prompt while a forget-all is armed).
+    let footer = if view.forget_armed {
+        "FORGET ALL personal data? Ctrl+F again to confirm, any other key aborts"
+    } else {
+        "Tab word · Ctrl+→ sent · Enter commit · Ctrl+S style · Ctrl+P learn · Ctrl+F forget · Esc"
+    };
+    lines.push(fit_head(footer, width).dim().to_string());
 
     lines.join("\r\n")
 }
@@ -524,12 +663,20 @@ struct SentenceUi<'a> {
     enabled: bool,
 }
 
+/// Learning UI state (grouped so helpers stay under the argument limit).
+struct LearnUi {
+    on: bool,
+    docs: u64,
+    forget_armed: bool,
+}
+
 /// Snapshot the display state into a [`Frame`] (terminal-sized).
 fn snapshot<'a>(
     buffer: &'a str,
     state: &'a SuggestionState,
     sent: &SentenceUi<'a>,
     word_rtt_ms: f64,
+    learn: &LearnUi,
     committed: &'a [String],
 ) -> Frame<'a> {
     let (cols, rows) = term_size().unwrap_or((80, 24));
@@ -547,6 +694,9 @@ fn snapshot<'a>(
         style_id: &state.style_id,
         generation: state.generation,
         word_rtt_ms,
+        learn_on: learn.on,
+        learn_docs: learn.docs,
+        forget_armed: learn.forget_armed,
         committed,
     }
 }
@@ -603,13 +753,21 @@ mod tests {
     }
 
     #[test]
-    fn context_carries_buffer_and_app_id() {
-        let ctx = build_context_update("hello wo");
+    fn context_carries_buffer_app_and_style() {
+        let ctx = build_context_update("hello wo", "sie");
         assert_eq!(ctx.app_id, "predict-cli");
         assert_eq!(ctx.before, "hello wo");
         assert!(ctx.after.is_empty());
         assert!(!ctx.sensitive);
-        assert_eq!(ctx.style_id, "default");
+        assert_eq!(ctx.style_id, "sie");
+    }
+
+    #[test]
+    fn style_cycles_through_builtins() {
+        assert_eq!(cycle_style("default"), "du");
+        assert_eq!(cycle_style("du"), "sie");
+        assert_eq!(cycle_style("sie"), "default");
+        assert_eq!(cycle_style("unknown"), "du");
     }
 
     fn suggestion_msg(gen: u64) -> DaemonMsg {
@@ -702,6 +860,9 @@ mod tests {
             style_id: "default",
             generation: 7,
             word_rtt_ms: 0.4,
+            learn_on: true,
+            learn_docs: 3,
+            forget_armed: false,
             committed: &[],
         };
         draw_frame(&view)
@@ -772,11 +933,15 @@ mod tests {
             style_id: "default",
             generation: 1,
             word_rtt_ms: 0.0,
+            learn_on: false,
+            learn_docs: 0,
+            forget_armed: false,
             committed: &[],
         };
         let plain = strip_ansi(&draw_frame(&view));
         assert!(plain.contains("no word suggestions"), "empty hint missing:\n{plain}");
-        assert!(plain.contains("sentence off"), "disabled hint missing:\n{plain}");
+        assert!(plain.contains("sent off"), "disabled hint missing:\n{plain}");
+        assert!(plain.contains("learn paused"), "learn state missing:\n{plain}");
     }
 
     #[test]
@@ -794,10 +959,194 @@ mod tests {
             style_id: "default",
             generation: 2,
             word_rtt_ms: 0.3,
+            learn_on: true,
+            learn_docs: 12,
+            forget_armed: true,
             committed: &["first line".to_string(), "second line".to_string()],
         };
         let plain = strip_ansi(&draw_frame(&view));
         assert!(plain.contains('…'), "pending marker missing:\n{plain}");
         assert!(plain.contains("committed: second line"), "history missing:\n{plain}");
+        assert!(plain.contains("learn on (12)"), "learn state missing:\n{plain}");
+        assert!(plain.contains("FORGET ALL"), "confirm prompt missing:\n{plain}");
+    }
+
+    #[test]
+    fn commit_msg_marks_settled_text() {
+        match build_commit_msg("hello world") {
+            ClientMsg::CommitText(commit) => {
+                assert_eq!(commit.text, "hello world");
+                assert_eq!(commit.style_id, "default");
+                assert!(!commit.sensitive);
+            }
+            other => panic!("expected CommitText, got {other:?}"),
+        }
+    }
+
+    fn learning_msg(enabled: bool, documents: u64) -> DaemonMsg {
+        DaemonMsg::LearningState(predict_proto::LearningState {
+            enabled,
+            documents,
+        })
+    }
+
+    #[test]
+    fn learning_reply_returns_state() {
+        let (mut client, mut server) = PairStream::pair().unwrap();
+        write_daemon_msg(&mut server, &learning_msg(false, 7)).unwrap();
+        let mut sentence = None;
+        let state = read_learning_reply(&mut client, 3, &mut sentence, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(!state.enabled);
+        assert_eq!(state.documents, 7);
+        assert!(sentence.is_none());
+    }
+
+    #[test]
+    fn learning_reply_stashes_fresh_sentence() {
+        let (mut client, mut server) = PairStream::pair().unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(4, " fox.")).unwrap();
+        write_daemon_msg(&mut server, &learning_msg(true, 2)).unwrap();
+        let mut sentence = None;
+        let state = read_learning_reply(&mut client, 4, &mut sentence, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(state.enabled);
+        assert_eq!(sentence.as_deref(), Some(" fox."));
+    }
+
+    #[test]
+    fn learning_reply_times_out_to_none() {
+        let (mut client, _server) = PairStream::pair().unwrap();
+        let mut sentence = None;
+        let state =
+            read_learning_reply(&mut client, 3, &mut sentence, Duration::from_millis(50)).unwrap();
+        assert!(state.is_none());
+    }
+
+    /// Full sentence flow over a socket pair against a stub daemon thread:
+    /// type, get words, collect the grey sentence, accept it, commit it.
+    /// Mirrors the main loop's exact call sequence (no TTY needed).
+    #[test]
+    fn full_sentence_flow_over_socket_pair() {
+        use std::sync::{Arc, Mutex};
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let daemon_log = Arc::clone(&log);
+
+        let (mut client, mut server) = PairStream::pair().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let mut docs = 0u64;
+            loop {
+                let note = |tag: String| daemon_log.lock().unwrap().push(tag);
+                match predict_proto::read_client_msg(&mut server) {
+                    Ok(ClientMsg::ContextUpdate(_)) => note("ctx".to_string()),
+                    Ok(ClientMsg::Suggest(req)) => {
+                        note(format!("suggest:{}", req.generation));
+                        let reply = DaemonMsg::Suggestion(Suggestion {
+                            generation: req.generation,
+                            candidates: vec![ProtoCandidate {
+                                text: "world".to_string(),
+                                score: 2.0,
+                            }],
+                            style_id: "default".to_string(),
+                        });
+                        write_daemon_msg(&mut server, &reply).unwrap();
+                    }
+                    Ok(ClientMsg::SuggestSentence(req)) => {
+                        note(format!("sentence-req:{}", req.generation));
+                        let reply = DaemonMsg::Sentence(SentenceSuggestion {
+                            generation: req.generation,
+                            text: " wide.".to_string(),
+                            confidence: -0.3,
+                            style_id: "default".to_string(),
+                        });
+                        write_daemon_msg(&mut server, &reply).unwrap();
+                    }
+                    Ok(ClientMsg::Cancel(req)) => {
+                        note(format!("cancel:{}", req.generation));
+                    }
+                    Ok(ClientMsg::CommitText(_)) => {
+                        note("commit".to_string());
+                        docs += 1;
+                        let reply = DaemonMsg::LearningState(predict_proto::LearningState {
+                            enabled: true,
+                            documents: docs,
+                        });
+                        write_daemon_msg(&mut server, &reply).unwrap();
+                    }
+                    Ok(ClientMsg::SetLearning(_)) | Ok(ClientMsg::ForgetAll) => {
+                        let reply = DaemonMsg::LearningState(predict_proto::LearningState {
+                            enabled: true,
+                            documents: docs,
+                        });
+                        write_daemon_msg(&mut server, &reply).unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // Type "hello wo": words arrive, sentence requested for gen 1.
+        let mut generation = 0u64;
+        let mut sentence_req = None;
+        let mut sentence = None;
+        let (state, _) = on_buffer_changed(
+            &mut client,
+            "hello wo",
+            "default",
+            &mut generation,
+            &mut sentence_req,
+            &mut sentence,
+            true,
+        )
+        .unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(state.candidates[0].text, "world");
+        assert_eq!(sentence_req, Some(1));
+
+        // Pause collects the grey sentence.
+        let grey = read_sentence_reply(&mut client, generation, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(grey, " wide.");
+        sentence = Some(grey);
+
+        // Ctrl+Right appends it verbatim.
+        let buffer = accept_sentence("hello wo", sentence.as_deref().unwrap());
+        assert_eq!(buffer, "hello wo wide.");
+
+        // Typing more cancels gen 1 before requesting gen 2.
+        let (state2, _) = on_buffer_changed(
+            &mut client,
+            &buffer,
+            "default",
+            &mut generation,
+            &mut sentence_req,
+            &mut sentence,
+            true,
+        )
+        .unwrap();
+        assert_eq!(generation, 2);
+        assert!(state2.candidates.iter().any(|c| c.text == "world"));
+
+        // Enter commits settled text; the ack carries the doc count.
+        send_commit(&mut client, &buffer).unwrap();
+        let mut no_sentence = None;
+        let learned = read_learning_reply(&mut client, generation, &mut no_sentence, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(learned.documents, 1);
+
+        drop(client);
+        daemon.join().unwrap();
+        let log = log.lock().unwrap();
+        let sequence: Vec<&str> = log.iter().map(String::as_str).collect();
+        // Cancel{1} precedes the gen-2 requests (same order as main loop).
+        let cancel_pos = sequence.iter().position(|s| *s == "cancel:1").unwrap();
+        let suggest_pos = sequence.iter().position(|s| *s == "suggest:2").unwrap();
+        assert!(cancel_pos < suggest_pos, "order wrong: {sequence:?}");
+        assert!(sequence.contains(&"sentence-req:1"));
+        assert!(sequence.contains(&"commit"));
     }
 }

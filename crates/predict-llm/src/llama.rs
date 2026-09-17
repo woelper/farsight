@@ -7,7 +7,7 @@
 //! hang — cancellation included.
 
 use super::{
-    Backend, CancelToken, LlmConfig, LlmError, SentenceOutput, SentenceRequest,
+    Backend, CancelToken, LlmConfig, LlmError, SentenceOutput, SentenceRequest, StopMode,
     piece_continues_word, strip_fragment,
 };
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -17,6 +17,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::token::logit_bias::LlamaLogitBias;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -37,6 +38,8 @@ struct Job {
     before: String,
     max_tokens: usize,
     threshold: f32,
+    stop: StopMode,
+    address: predict_core::AddressForm,
     cancel: CancelToken,
     reply: mpsc::Sender<Result<Option<SentenceOutput>, LlmError>>,
 }
@@ -72,6 +75,8 @@ impl Backend for LlamaBackend {
             before: req.before.clone(),
             max_tokens: req.max_tokens,
             threshold: req.confidence_threshold,
+            stop: req.stop,
+            address: req.address,
             cancel: cancel.clone(),
             reply: reply_tx,
         };
@@ -177,6 +182,34 @@ fn is_sentence_end(text: &str) -> bool {
     text.ends_with(['.', '!', '?', '…'])
 }
 
+/// Clause-terminal punctuation for [`StopMode::Clause`] (stop AFTER
+/// including it; sentence ends count as clause ends too).
+fn is_clause_end(text: &str) -> bool {
+    text.ends_with([',', ';', ':', '.', '!', '?', '…'])
+}
+
+/// Single-token ids spelling banned words (each in bare and space-prefixed
+/// piece form). Multi-token spellings are left to the post-generation
+/// check — logit bias can only ban whole tokens.
+fn banned_token_ids(model: &LlamaModel, address: predict_core::AddressForm) -> Vec<LlamaLogitBias> {
+    let (words, _) = predict_core::banned_words(address);
+    let mut ids = Vec::new();
+    let mut seen: Vec<LlamaToken> = Vec::new();
+    for word in words {
+        for form in [(*word).to_string(), format!(" {word}")] {
+            if let Ok(tokens) = model.str_to_token(&form, AddBos::Never) {
+                if let [single] = tokens.as_slice() {
+                    if !seen.contains(single) {
+                        seen.push(*single);
+                        ids.push(LlamaLogitBias::new(*single, f32::NEG_INFINITY));
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
 #[allow(clippy::too_many_lines)]
 fn process_job(
     model: &LlamaModel,
@@ -254,7 +287,17 @@ fn process_job(
         return Err(LlmError::Cancelled);
     }
 
-    let mut sampler = LlamaSampler::greedy();
+    // Greedy decoding: deterministic and reproducible (evals compare
+    // like-for-like). Temperature/penalty variants were trialled and showed
+    // no clear win on open prose (see ADR 0006); revisit with data.
+    // Address-form bans ride along as -inf logit biases.
+    let mut sampler = match banned_token_ids(model, job.address) {
+        biases if biases.is_empty() => LlamaSampler::greedy(),
+        biases => LlamaSampler::chain_simple([
+            LlamaSampler::logit_bias(model.n_vocab(), &biases),
+            LlamaSampler::greedy(),
+        ]),
+    };
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut emitted = 0usize;
     let mut text = String::new();
@@ -299,6 +342,9 @@ fn process_job(
         if is_sentence_end(&text) {
             break;
         }
+        if job.stop == StopMode::Clause && is_clause_end(&text) {
+            break;
+        }
 
         // Feed the token back for the next step.
         let pos = cached.len() as i32;
@@ -328,6 +374,11 @@ fn process_job(
     if completion.trim().is_empty() {
         return Ok(None);
     }
+    // Backstop for multi-token banned forms the logit bias cannot cover:
+    // never show an address violation, at the cost of silence.
+    if predict_core::violates(&completion, job.address) {
+        return Ok(None);
+    }
     let confidence = (logprob_sum / generated as f64) as f32;
     if confidence < job.threshold {
         return Ok(None);
@@ -340,6 +391,7 @@ fn process_job(
     }))
 }
 
+/// Greedy choice with its logprob: argmax logit, log-softmax normalized.
 /// Greedy choice with its logprob: argmax logit, log-softmax normalized.
 fn greedy_choice(array: &llama_cpp_2::token::data_array::LlamaTokenDataArray) -> (LlamaToken, f32) {
     let mut best_id = LlamaToken(0);
@@ -396,8 +448,8 @@ fn heal_first_token(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Backend, CancelToken, LlmConfig, SentenceRequest};
-    use super::{common_prefix_len, emit_complete, is_sentence_end, truncate_to_last_chars};
+    use super::super::{Backend, CancelToken, LlmConfig, SentenceRequest, StopMode};
+    use super::{common_prefix_len, emit_complete, is_clause_end, is_sentence_end, truncate_to_last_chars};
     use llama_cpp_2::token::LlamaToken;
 
     #[test]
@@ -442,6 +494,53 @@ mod tests {
         assert!(!is_sentence_end(""));
     }
 
+    #[test]
+    fn clause_end_detects_phrase_boundaries() {
+        assert!(is_clause_end("salt,"));
+        assert!(is_clause_end("this;"));
+        assert!(is_clause_end("note:"));
+        assert!(is_clause_end("done."));
+        assert!(!is_clause_end("plain words"));
+    }
+
+    /// Opt-in style-guarantee test against a real GGUF (set
+    /// PREDICT_MODEL_PATH). Passes vacuously without a model; with one it
+    /// asserts the M5 done-criterion shape: whatever comes back under a Sie
+    /// ban contains no du-family token (rejection shows as `None`).
+    #[test]
+    fn real_model_never_violates_ban() {
+        let path = std::env::var("PREDICT_MODEL_PATH").unwrap_or_default();
+        if path.is_empty() {
+            return;
+        }
+        let config = LlmConfig {
+            enabled: true,
+            model_path: path,
+            max_tokens: 16,
+            confidence_threshold: -99.0,
+            ..Default::default()
+        };
+        let backend = super::LlamaBackend::load(&config).unwrap();
+        for before in [
+            "Kannst du mir sagen, ob ",
+            "Wenn du morgen Zeit hast, ",
+            "Bitte prüfe, ob du ",
+        ] {
+            let req = SentenceRequest {
+                before: before.to_string(),
+                max_tokens: 16,
+                confidence_threshold: -99.0,
+                stop: StopMode::Sentence,
+                address: predict_core::AddressForm::Sie,
+            };
+            let out = backend.complete_sentence(&req, &CancelToken::new()).unwrap();
+            assert!(
+                out.is_none_or(|o| !predict_core::violates(&o.text, predict_core::AddressForm::Sie)),
+                "ban violated for {before:?}"
+            );
+        }
+    }
+
     /// Opt-in smoke test against a real GGUF (set PREDICT_MODEL_PATH).
     /// Skipped silently otherwise so plain `cargo test` stays fast.
     #[test]
@@ -462,6 +561,8 @@ mod tests {
             before: "the quick brown fox jumps over the lazy ".to_string(),
             max_tokens: 16,
             confidence_threshold: -99.0,
+        stop: StopMode::Sentence,
+        address: predict_core::AddressForm::None,
         };
         let out = backend
             .complete_sentence(&req, &CancelToken::new())

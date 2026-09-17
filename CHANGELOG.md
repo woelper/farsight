@@ -2,13 +2,76 @@
 
 All notable changes to `predict` are documented here, per milestone.
 
-## [Unreleased]
+## [0.7.0] — M6 Linux desktop input
+
+- `frontend-ibus`: IBus engine over D-Bus (`zbus` blocking API) that
+  forwards typing context to `predictd` and renders suggestions as preedit
+  ghost text with a lookup-table fallback. 10 ms predictd budget per
+  keystroke; keys always pass through (only Tab-accept consumes).
+  See `docs/adr/0009-m6-ibus.md`, install: `docs/INSTALL-linux.md`.
+- Engine self-registers (`RegisterComponent`, payload in
+  `frontend-ibus::component` with signature unit tests); the daemon
+  instantiates through our factory on `SetGlobalEngine`. Finding: the
+  daemon only activates catalog-known component names (unknown names stay
+  inert), and this build scans only `/usr/share/ibus/component` — hence
+  system-level install.
+- Exact IBus wire tags (`IBusText`, attrs, lookup table) after the daemon
+  failed closed on tagless structs; password/terminal silence via
+  `Properties.Set(ContentType)`; settled text learned on focus-out.
+- Tests: engine-direct e2e against a real daemon (`ibus_engine`) plus full
+  client path on a private daemon (`ibus_mediated`: activation, ghost,
+  commit, password silence, slow-daemon safety). GTK/Qt app check stays
+  manual (documented steps).
+
+## [0.6.0] — M5 style-aware prediction
+
+- `predict-core::style`: `StyleSpec`/`ResolvedStyle`, `default`/`du`/`sie`
+  builtins, `detect_address` (capitalized Sie), word-ban lists, violation
+  checking. Resolution: explicit > sticky > per-app > global.
+- Daemon: `StyleRegistry`, per-request style resolution, word-tier
+  filtering, LLM logit-bias + post-check, `StopMode::Clause`.
+- CLI: style cycling (Ctrl+S), style display.
+- Eval: `eval_style` run clean — 0 violations (du accept 0.000, sie 0.200
+  on the style corpus). See `docs/adr/0008-m5-style.md`.
+- Honest generalization numbers on unseen novels (Pride and Prejudice,
+  Werther): word top-1 ~0.2, personal-tier temporal deltas +397 EN / +812
+  DE keystrokes. See `docs/NOVEL-EVAL.md`.
+
+## [0.5.0] — M4 personal memory (plus unreleased CLI + base overhauls)
 
 - `predict-cli` overhaul: bordered TUI (title, grey ghost sentence,
   highlighted top word, status line with word RTT, dimmed history/footer,
   width fitting), sentence prediction on every keystroke by default
-  (`--no-sentence` opts out, `--help` documents keys), `--no-sentence`
-  flag, pure `draw_frame` covered by tests. See `docs/adr/0005-cli-overhaul.md`.
+  (`--no-sentence` opts out, `--help` documents keys), pure `draw_frame`
+  covered by tests. See `docs/adr/0005-cli-overhaul.md`.
+- Base-quality overhaul: real EN+DE training corpora (Gutenberg books, see
+  `corpora/SOURCES.md`), one model per language with function-word
+  detection (no more mixed-language suggestions; interim until M5),
+  pre-sorted n-gram indexes (p99 back inside 5 ms on real vocab),
+  `scripts/setup-model.sh` one-command LLM setup, `start.sh` warns when the
+  slow tier is off, confidence gate re-tuned to −1.5.
+  See `docs/adr/0006-base-quality.md`.
+- `predict-store` (new, rusqlite bundled): settled documents (text, style
+  id, language, timestamp), per-language uni/bi/tri counts, FTS5/BM25 index
+  with sync triggers; `clear_all` for forget-all.
+- `predict-ngram`: `PersonalCounts`/`PersonalBundle`, `BlendedPredictor`
+  (`λ·p_base + (1−λ)·p_personal`, contextual + OOV personal only),
+  `LangBlended` routing by current sentence (shared by daemon and eval);
+  shared `tokenize_text` / `sentence_fragment` moved to `predict-core`.
+- `predict-proto` v3: `CommitText{text, style_id, sensitive}`, `ForgetAll`,
+  `SetLearning{enabled}`, `LearningState{enabled, documents}`.
+- `predict-llm`: `build_grounded_prompt` for retrieval grounding.
+- `predictd`: SQLite store (`[personal]`: db path, λ default 0.7, on by
+  default), per-request bundle reloads, FTS5 retrieval refreshed at sentence
+  boundaries only, acked commits/forget/pause, sensitive silence for both
+  tiers, audited lock order.
+- `predict-cli`: Enter commits settled text, Ctrl+P pauses/resumes,
+  Ctrl+F twice forgets, status shows `learn on (N)` / `learn paused`.
+- `predict-eval`: unified simulation with retrieval hook, temporal split
+  (`temporal_split` + `evaluate_temporal`), `eval_temporal` example.
+- Measured: +6 keystrokes on held-out text (256 vs 262); forget-all leaves
+  0 documents / 0 counts / 0 FTS rows.
+- Docs: `docs/adr/0007-m4-personal-memory.md`, ARCHITECTURE status + results.
 
 ## [0.4.0] — M3 slow tier (local LLM)
 

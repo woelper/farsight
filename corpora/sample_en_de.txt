@@ -16,36 +16,36 @@ see you soon take care
 see you tomorrow take care
 the meeting is at ten o clock
 the meeting is at ten o clock in the main room
-ich bin heute im büro
-ich bin morgen im büro
-ich bin heute im homeoffice
-das wetter ist heute schön
-das wetter ist morgen schön
-vielen dank für ihre hilfe
-vielen dank für deine hilfe
-bitte finden sie den bericht im anhang
-bitte finde den bericht im anhang
-wir sehen uns morgen um zehn uhr
-wir sehen uns heute um zehn uhr
-ich schreibe gern emails am morgen
-ich schreibe gern emails am morgen vor der arbeit
-danke für deine nachricht
-danke für ihre nachricht
-bis bald und liebe grüße
-bis morgen und liebe grüße
+Ich bin heute im Büro
+Ich bin morgen im Büro
+Ich bin heute im Homeoffice
+Das Wetter ist heute schön
+Das Wetter ist morgen schön
+Vielen Dank für Ihre Hilfe
+Vielen Dank für deine Hilfe
+Bitte finden Sie den Bericht im Anhang
+Bitte finde den Bericht im Anhang
+Wir sehen uns morgen um zehn Uhr
+Wir sehen uns heute um zehn Uhr
+Ich schreibe gern Emails am Morgen
+Ich schreibe gern Emails am Morgen vor der Arbeit
+Danke für deine Nachricht
+Danke für Ihre Nachricht
+Bis bald und liebe Grüße
+Bis morgen und liebe Grüße
 the project deadline is next friday
 the project deadline is next friday at noon
 can you review the document when you have time
 can you review the document when you have a moment
 let me know if you need anything else
 let me know if you need anything
-können sie das dokument prüfen wenn sie zeit haben
-kannst du das dokument prüfen wenn du zeit hast
-lassen sie mich wissen ob sie noch etwas brauchen
-lass mich wissen ob du noch etwas brauchst
+Können Sie das Dokument prüfen wenn Sie Zeit haben
+Kannst du das Dokument prüfen wenn du Zeit hast
+Lassen Sie mich wissen ob Sie noch etwas brauchen
+Lass mich wissen ob du noch etwas brauchst
 the quick brown fox is quick and brown
 hello again world hello again
-ich habe heute viel zu tun
-ich habe morgen viel zu tun
+Ich habe heute viel zu tun
+Ich habe morgen viel zu tun
 we will discuss the budget in the next meeting
 we will discuss the budget in the next call
