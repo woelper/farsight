@@ -2,6 +2,20 @@
 
 All notable changes to `predict` are documented here, per milestone.
 
+## [Unreleased]
+
+- CLI sentence accept moves Ctrl+Right → Shift+Tab (both terminal
+  encodings: BackTab and Tab+Shift).
+- Slow tier streams: partial continuations paint from the first tokens
+  (same running confidence gate, so partials are never below-gate text);
+  gated/failed tails retract instead of lingering; CLI overwrites the
+  ghost head-to-tail while idle.
+- Sentence quality: the sampler chain actually applies now (logit-bias
+  bans were observe-only before) plus a mild repetition penalty —
+  greedy loops ("… Friday and the report is due on Friday and …") are
+  gone; completions must contain a word character (no "." ghosts) and no
+  longer double spaces after the cursor.
+
 ## [0.7.0] — M6 Linux desktop input
 
 - `frontend-ibus`: IBus engine over D-Bus (`zbus` blocking API) that

@@ -2,7 +2,7 @@
 //!
 //! Type text, see word suggestions live, Tab accepts the top word. Sentence
 //! prediction is on by default: every refresh also asks the slow tier, and
-//! the latest completion renders grey after the cursor (Ctrl+Right accepts
+//! the latest completion renders grey after the cursor (Shift+Tab accepts
 //! the whole sentence). Every keystroke bumps the generation and cancels
 //! superseded work; replies for older generations are ignored. A slow daemon
 //! never blocks typing: reads time out and render proceeds without
@@ -19,7 +19,8 @@ use crossterm::terminal::{
 use crossterm::execute;
 use predict_proto::{
     CancelMsg, ClientMsg, CommitText, ContextUpdate, DaemonMsg, LearningState, ProtoCandidate,
-    SetLearning, SuggestRequest, read_daemon_msg, socket_path, write_client_msg,
+    SentenceSuggestion, SetLearning, SuggestRequest, read_daemon_msg, socket_path,
+    write_client_msg,
 };
 use std::io::{Stdout, Write};
 use std::os::unix::net::UnixStream;
@@ -53,7 +54,7 @@ fn usage() -> &'static str {
      \n\
      Keys:\n  \
      Tab          accept the top word\n  \
-     Ctrl+Right   accept the whole sentence (grey text)\n  \
+     Shift+Tab    accept the whole sentence (grey text)\n  \
      Enter        commit the line (settled text for learning)\n  \
      Ctrl+S       cycle prediction style (default/du/sie)\n  \
      Ctrl+P       pause/resume learning\n  \
@@ -169,12 +170,20 @@ fn main() -> Result<()> {
                     }
                     KeyCode::Tab => {
                         forget_armed = false;
-                        if let Some(top) = state.candidates.first() {
+                        if is_sentence_accept(KeyCode::Tab, key.modifiers) {
+                            // Shift+Tab on terminals that report it as
+                            // Tab+SHIFT instead of BackTab.
+                            if let Some(text) = sentence.take() {
+                                buffer = accept_sentence(&buffer, &text);
+                                mutated = true;
+                            }
+                        } else if let Some(top) = state.candidates.first() {
                             buffer = accept_completion(&buffer, &top.text);
                             mutated = true;
                         }
                     }
-                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Most terminals report Shift+Tab as BackTab (ESC[Z).
+                    KeyCode::BackTab => {
                         forget_armed = false;
                         if let Some(text) = sentence.take() {
                             buffer = accept_sentence(&buffer, &text);
@@ -217,16 +226,17 @@ fn main() -> Result<()> {
                 state = fresh;
                 word_rtt_ms = rtt;
             }
-        } else if args.sentence_enabled && !buffer.is_empty() && sentence.is_none() {
-            // Typing pause: collect a sentence reply (requested on the last
-            // refresh; re-request defensively if the generation moved on).
+        } else if args.sentence_enabled && !buffer.is_empty() {
+            // Typing pause: collect sentence messages for this generation
+            // (requested on the last refresh; re-request defensively if the
+            // generation moved on). Streaming workers send a message per
+            // grown prefix; applying head to tail keeps the ghost live.
             if sentence_req != Some(generation) {
                 request_sentence(&mut stream, &buffer, current_style, generation)?;
                 sentence_req = Some(generation);
             }
-            if let Some(text) = read_sentence_reply(&mut stream, generation, SENTENCE_TRY)? {
-                sentence = Some(text);
-            }
+            let updates = drain_sentence(&mut stream, generation, SENTENCE_TRY)?;
+            apply_sentence(&mut sentence, &updates);
         }
         render(
             &mut stdout,
@@ -300,17 +310,47 @@ fn read_words_reply(
     }
 }
 
-/// Read until the sentence reply for `generation` arrives or `timeout`
-/// passes. Returns `None` on timeout (still computing, gated, or disabled).
-fn read_sentence_reply(
+/// Drain every sentence message for `generation` that arrives within
+/// `timeout`, in order. Streaming workers send one per grown prefix plus a
+/// terminal message; callers apply them head to tail (empty text retracts).
+fn drain_sentence(
     stream: &mut UnixStream,
     generation: u64,
     timeout: Duration,
-) -> Result<Option<String>> {
-    match predict_proto::read_sentence_reply(stream, generation, timeout) {
-        Ok(Some(s)) => Ok(Some(s.text)),
-        Ok(None) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!(e).context("read sentence")),
+) -> Result<Vec<SentenceSuggestion>> {
+    let deadline = Instant::now() + timeout;
+    let mut out = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .context("set read timeout")?;
+        match read_daemon_msg(stream) {
+            Ok(DaemonMsg::Sentence(s)) if s.generation == generation => out.push(s),
+            Ok(_) => {} // stale or word reply: discard, keep waiting
+            Err(e) if predict_proto::is_timeout(&e) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+            Err(e) => return Err(anyhow::anyhow!(e).context("read sentence")),
+        }
+    }
+    Ok(out)
+}
+
+/// Apply drained sentence messages to the ghost: latest text wins, an empty
+/// message retracts a shown partial (gated or failed tail).
+fn apply_sentence(sentence: &mut Option<String>, updates: &[SentenceSuggestion]) {
+    for update in updates {
+        if update.text.is_empty() {
+            *sentence = None;
+        } else {
+            *sentence = Some(update.text.clone());
+        }
     }
 }
 
@@ -413,12 +453,8 @@ fn read_learning_reply(
             .context("set read timeout")?;
         match read_daemon_msg(stream) {
             Ok(DaemonMsg::LearningState(state)) => return Ok(Some(state)),
-            Ok(DaemonMsg::Sentence(s))
-                if s.generation == current_gen && !s.text.is_empty() =>
-            {
-                if sentence.is_none() {
-                    *sentence = Some(s.text);
-                }
+            Ok(DaemonMsg::Sentence(s)) if s.generation == current_gen => {
+                apply_sentence(sentence, std::slice::from_ref(&s));
             }
             Ok(_) => {} // stale: discard, keep waiting
             Err(e) if predict_proto::is_timeout(&e) => {
@@ -485,6 +521,14 @@ fn accept_completion(buffer: &str, candidate: &str) -> String {
         .take(char_count.saturating_sub(prefix_len))
         .collect();
     format!("{stem}{candidate} ")
+}
+
+/// Sentence-accept key: Shift+Tab, reported either as BackTab (most
+/// terminals, ESC[Z) or as Tab with the Shift modifier (modifyOtherKeys).
+/// Plain Tab stays word-accept.
+fn is_sentence_accept(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    matches!(code, KeyCode::BackTab)
+        || (matches!(code, KeyCode::Tab) && modifiers.contains(KeyModifiers::SHIFT))
 }
 
 /// Accept a sentence suggestion: append it verbatim (it already continues
@@ -750,6 +794,18 @@ mod tests {
             "the quick brown fox."
         );
         assert_eq!(accept_sentence("the qui", "ck."), "the quick.");
+        assert_eq!(accept_sentence("", "Hello."), "Hello.");
+    }
+
+    #[test]
+    fn sentence_accept_key_covers_both_shift_tab_encodings() {
+        use crossterm::event::KeyModifiers;
+        assert!(is_sentence_accept(KeyCode::BackTab, KeyModifiers::empty()));
+        assert!(is_sentence_accept(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(is_sentence_accept(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert!(!is_sentence_accept(KeyCode::Tab, KeyModifiers::empty()));
+        assert!(!is_sentence_accept(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert!(!is_sentence_accept(KeyCode::Enter, KeyModifiers::SHIFT));
     }
 
     #[test]
@@ -812,17 +868,16 @@ mod tests {
         let (mut client, mut server) = PairStream::pair().unwrap();
         write_daemon_msg(&mut server, &suggestion_msg(9)).unwrap();
         write_daemon_msg(&mut server, &sentence_msg(9, " fox.")).unwrap();
-        let text = read_sentence_reply(&mut client, 9, Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        assert_eq!(text, " fox.");
+        let updates = drain_sentence(&mut client, 9, Duration::from_secs(5)).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].text, " fox.");
     }
 
     #[test]
     fn sentence_reply_times_out_to_none() {
         let (mut client, _server) = PairStream::pair().unwrap();
-        let text = read_sentence_reply(&mut client, 3, Duration::from_millis(50)).unwrap();
-        assert!(text.is_none());
+        let updates = drain_sentence(&mut client, 3, Duration::from_millis(50)).unwrap();
+        assert!(updates.is_empty());
     }
 
     #[test]
@@ -833,8 +888,50 @@ mod tests {
         // Wanting gen 9: both stale frames are discarded, then timeout.
         let state = read_words_reply(&mut client, 9, Duration::from_millis(50)).unwrap();
         assert!(state.candidates.is_empty());
-        let text = read_sentence_reply(&mut client, 9, Duration::from_millis(50)).unwrap();
-        assert!(text.is_none());
+        let updates = drain_sentence(&mut client, 9, Duration::from_millis(50)).unwrap();
+        assert!(updates.is_empty());
+    }
+
+    #[test]
+    fn drain_keeps_every_same_generation_update_in_order() {
+        let (mut client, mut server) = PairStream::pair().unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(9, " f")).unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(9, " fox")).unwrap();
+        write_daemon_msg(&mut server, &sentence_msg(9, " fox.")).unwrap();
+        let updates = drain_sentence(&mut client, 9, Duration::from_secs(5)).unwrap();
+        let texts: Vec<&str> = updates.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec![" f", " fox", " fox."]);
+    }
+
+    #[test]
+    fn apply_sentence_overwrites_and_retracts() {
+        let mut sentence = None;
+        apply_sentence(&mut sentence, &[]);
+        assert_eq!(sentence, None);
+        let partial = SentenceSuggestion {
+            generation: 9,
+            text: " fox".to_string(),
+            confidence: -0.5,
+            style_id: "default".to_string(),
+        };
+        let full = SentenceSuggestion {
+            generation: 9,
+            text: " fox.".to_string(),
+            confidence: -0.5,
+            style_id: "default".to_string(),
+        };
+        let retract = SentenceSuggestion {
+            generation: 9,
+            text: String::new(),
+            confidence: f32::NEG_INFINITY,
+            style_id: "default".to_string(),
+        };
+        apply_sentence(&mut sentence, &[partial]);
+        assert_eq!(sentence.as_deref(), Some(" fox"));
+        apply_sentence(&mut sentence, &[full]);
+        assert_eq!(sentence.as_deref(), Some(" fox."));
+        apply_sentence(&mut sentence, &[retract]);
+        assert_eq!(sentence, None);
     }
 
     fn frame_for(buffer: &str, sentence: Option<&str>) -> String {
@@ -1105,14 +1202,12 @@ mod tests {
         assert_eq!(state.candidates[0].text, "world");
         assert_eq!(sentence_req, Some(1));
 
-        // Pause collects the grey sentence.
-        let grey = read_sentence_reply(&mut client, generation, Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
-        assert_eq!(grey, " wide.");
-        sentence = Some(grey);
+        // Pause collects the grey sentence (drained head to tail).
+        let updates = drain_sentence(&mut client, generation, Duration::from_secs(5)).unwrap();
+        apply_sentence(&mut sentence, &updates);
+        assert_eq!(sentence.as_deref(), Some(" wide."));
 
-        // Ctrl+Right appends it verbatim.
+        // Shift+Tab appends it verbatim.
         let buffer = accept_sentence("hello wo", sentence.as_deref().unwrap());
         assert_eq!(buffer, "hello wo wide.");
 

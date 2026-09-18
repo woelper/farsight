@@ -84,7 +84,8 @@ No network code in any crate (non-negotiable).
   sentence, highlighted top word, status line with word RTT, dimmed history.
   Live word suggestions per keystroke, Tab accepts the top word, Enter
   commits, Esc quits. Sentence prediction runs on every keystroke by default
-  (`--no-sentence` opts out), shown grey inline, Ctrl+Right accepts. Reads
+  (`--no-sentence` opts out) and streams grey inline token-by-token,
+  Shift+Tab accepts. Reads
   use deadlines and discard foreign frames — a slow daemon never stalls
   typing. Enter commits settled text for learning; Ctrl+P pauses/resumes
   (status shows `learn on (N)` / `learn paused`); Ctrl+F twice forgets all.
@@ -105,9 +106,10 @@ No network code in any crate (non-negotiable).
 - **Sentence suggestion (M3, working)**: typing pause (200 ms) → CLI sends
   `SuggestSentence{generation}` (same generation: it refines, not
   supersedes) → daemon worker runs the LLM with the shared cancel token +
-  KV reuse + token healing → replies `Sentence` only while the generation
-  is current and confidence ≥ gate → CLI renders grey inline, Ctrl+Right
-  accepts. Cancel/newer generation aborts silently.
+  KV reuse + token healing + repetition penalty → streams `Sentence`
+  partials (running gate) while the generation is current, final reply at
+  stop/confidence ≥ gate → CLI renders grey inline, Shift+Tab
+  accepts. Cancel/newer generation aborts silently; gated tails retract.
 - **Learning (M4, working)**: Enter/pause/leave commits settled text →
   `predict-store` (tagged by style id for M5) → per-language counts +
   FTS5 index. Word decode blends `p = λ·p_base + (1−λ)·p_personal`

@@ -49,7 +49,7 @@ cargo run -p predict-eval --example eval_sentence -- <model.gguf> [threshold]
 # manual equivalent:
 ./target/debug/predictd &          # start the per-user daemon
 ./target/debug/predict-cli         # type; Tab accepts word, grey sentence
-                                   # follows as you type, Ctrl+Right accepts
+                                   # streams as you type, Shift+Tab accepts
                                    # it, Enter commits, Ctrl+P pauses learning,
                                    # Ctrl+F twice forgets all, Esc quits
 ```

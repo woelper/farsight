@@ -77,6 +77,17 @@ pub struct SentenceOutput {
     pub tokens_generated: usize,
 }
 
+/// An in-progress sentence: text so far plus the running mean logprob.
+/// Emitted live so clients can paint before generation finishes; the final
+/// [`SentenceOutput`] (or silence) still resolves the request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartialSentence {
+    /// Continuation so far (same stripping rules as [`SentenceOutput`]).
+    pub text: String,
+    /// Mean token logprob over tokens generated so far.
+    pub confidence: f32,
+}
+
 /// Errors from the slow tier.
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum LlmError {
@@ -107,6 +118,23 @@ pub trait Backend: Send + Sync {
         req: &SentenceRequest,
         cancel: &CancelToken,
     ) -> Result<Option<SentenceOutput>, LlmError>;
+
+    /// Generate with live partials: `on_partial` fires as the text grows
+    /// (same confidence gate applied to the running mean, so partials are
+    /// never below-gate text). The return value resolves the request
+    /// exactly like [`complete_sentence`](Self::complete_sentence).
+    ///
+    /// The default impl is pure single-shot (no partials, just the final
+    /// result), so backends without true streaming stay source-compatible
+    /// and emit no redundant traffic.
+    fn complete_sentence_streaming(
+        &self,
+        req: &SentenceRequest,
+        cancel: &CancelToken,
+        _on_partial: Box<dyn FnMut(PartialSentence) + Send>,
+    ) -> Result<Option<SentenceOutput>, LlmError> {
+        self.complete_sentence(req, cancel)
+    }
 
     /// Backend name for logs and eval reports.
     fn name(&self) -> &str;
@@ -389,6 +417,42 @@ mod tests {
             .complete_sentence(&req("the quick ", -1.5), &CancelToken::new())
             .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn default_streaming_emits_no_partials() {
+        use std::sync::{Arc, Mutex};
+        let backend = StubBackend::fixed("brown fox", -0.2);
+        let partials = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&partials);
+        let out = backend
+            .complete_sentence_streaming(
+                &req("the quick ", -1.5),
+                &CancelToken::new(),
+                Box::new(move |p: PartialSentence| sink.lock().unwrap().push(p)),
+            )
+            .unwrap()
+            .expect("passes gate");
+        assert_eq!(out.text, "brown fox");
+        // Single-shot backends resolve via the return value only.
+        assert!(partials.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_streaming_stays_silent_below_gate() {
+        use std::sync::{Arc, Mutex};
+        let backend = StubBackend::fixed("brown fox", -3.0);
+        let partials = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&partials);
+        let out = backend
+            .complete_sentence_streaming(
+                &req("the quick ", -1.5),
+                &CancelToken::new(),
+                Box::new(move |p: PartialSentence| sink.lock().unwrap().push(p)),
+            )
+            .unwrap();
+        assert!(out.is_none());
+        assert!(partials.lock().unwrap().is_empty());
     }
 
     #[test]

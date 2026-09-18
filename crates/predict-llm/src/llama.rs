@@ -7,8 +7,8 @@
 //! hang — cancellation included.
 
 use super::{
-    Backend, CancelToken, LlmConfig, LlmError, SentenceOutput, SentenceRequest, StopMode,
-    piece_continues_word, strip_fragment,
+    Backend, CancelToken, LlmConfig, LlmError, PartialSentence, SentenceOutput, SentenceRequest,
+    StopMode, piece_continues_word, strip_fragment,
 };
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend as LlamaCppBackend;
@@ -32,6 +32,11 @@ const PROMPT_MAX_TOKENS: usize = 384;
 const HEALING_TOP_K: usize = 200;
 /// Scratch buffer for one token piece (bytes).
 const PIECE_BUF: usize = 64;
+/// Repetition-penalty window (tokens) against greedy loops
+/// ("Friday ... Friday ..."); frequency/presence stay off.
+const PENALTY_LAST_N: i32 = 64;
+/// Repeat multiplier; 1.0 disables. Mild: break loops, keep determinism.
+const PENALTY_REPEAT: f32 = 1.1;
 
 /// Work item for the inference thread.
 struct Job {
@@ -41,6 +46,7 @@ struct Job {
     stop: StopMode,
     address: predict_core::AddressForm,
     cancel: CancelToken,
+    on_partial: Box<dyn FnMut(PartialSentence) + Send>,
     reply: mpsc::Sender<Result<Option<SentenceOutput>, LlmError>>,
 }
 
@@ -70,6 +76,31 @@ impl Backend for LlamaBackend {
         req: &SentenceRequest,
         cancel: &CancelToken,
     ) -> Result<Option<SentenceOutput>, LlmError> {
+        self.submit(req, cancel, Box::new(|_| {}))
+    }
+
+    fn complete_sentence_streaming(
+        &self,
+        req: &SentenceRequest,
+        cancel: &CancelToken,
+        on_partial: Box<dyn FnMut(PartialSentence) + Send>,
+    ) -> Result<Option<SentenceOutput>, LlmError> {
+        self.submit(req, cancel, on_partial)
+    }
+
+    fn name(&self) -> &str {
+        "llama.cpp"
+    }
+}
+
+impl LlamaBackend {
+    /// Enqueue one job and block for its resolution.
+    fn submit(
+        &self,
+        req: &SentenceRequest,
+        cancel: &CancelToken,
+        on_partial: Box<dyn FnMut(PartialSentence) + Send>,
+    ) -> Result<Option<SentenceOutput>, LlmError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         let job = Job {
             before: req.before.clone(),
@@ -78,6 +109,7 @@ impl Backend for LlamaBackend {
             stop: req.stop,
             address: req.address,
             cancel: cancel.clone(),
+            on_partial,
             reply: reply_tx,
         };
         self.tx
@@ -86,10 +118,6 @@ impl Backend for LlamaBackend {
         reply_rx
             .recv()
             .map_err(|_| LlmError::Inference("llm worker dropped the reply".to_string()))?
-    }
-
-    fn name(&self) -> &str {
-        "llama.cpp"
     }
 }
 
@@ -127,8 +155,8 @@ fn worker_main(config: LlmConfig, rx: mpsc::Receiver<Job>) {
         }
     };
     let mut cached: Vec<LlamaToken> = Vec::new();
-    for job in rx {
-        let result = process_job(&model, &mut ctx, &mut cached, &config, &job);
+    for mut job in rx {
+        let result = process_job(&model, &mut ctx, &mut cached, &config, &mut job);
         let _ = job.reply.send(result);
     }
 }
@@ -177,6 +205,27 @@ fn emit_complete(buf: &[u8], emitted: &mut usize) -> String {
     }
 }
 
+/// Strip the healed fragment prefix: the first piece starts with the
+/// in-progress fragment (after one optional leading blank), so the
+/// suggestion continues the cursor. `None` when the prefix is absent
+/// (mid-fragment partials) or nothing remains. With no fragment, one
+/// leading blank is still redundant when `before` already ends with
+/// whitespace ("brown " + " fox" would double the space).
+fn strip_healed_prefix(text: &str, fragment: &str, before_ends_ws: bool) -> Option<String> {
+    if fragment.is_empty() {
+        if before_ends_ws {
+            let no_blank = text.strip_prefix(' ').unwrap_or(text);
+            let no_blank = no_blank.strip_prefix('▁').unwrap_or(no_blank);
+            return Some(no_blank.to_string());
+        }
+        return Some(text.to_string());
+    }
+    let no_blank = text.strip_prefix(' ').unwrap_or(text);
+    no_blank
+        .strip_prefix(fragment)
+        .map(str::to_string)
+}
+
 /// Sentence-terminal punctuation (stop AFTER including it).
 fn is_sentence_end(text: &str) -> bool {
     text.ends_with(['.', '!', '?', '…'])
@@ -216,7 +265,7 @@ fn process_job(
     ctx: &mut llama_cpp_2::context::LlamaContext<'_>,
     cached: &mut Vec<LlamaToken>,
     config: &LlmConfig,
-    job: &Job,
+    job: &mut Job,
 ) -> Result<Option<SentenceOutput>, LlmError> {
     let start = Instant::now();
     if job.cancel.is_cancelled() {
@@ -229,6 +278,7 @@ fn process_job(
     // Token healing setup: drop the in-progress fragment from the prompt so
     // decoding starts at a word boundary, then constrain the first token.
     let (prompt_text, fragment) = strip_fragment(&before);
+    let before_ends_ws = before.ends_with([' ', '\t']);
     let mut prompt_tokens = model
         .str_to_token(&prompt_text, AddBos::Always)
         .map_err(|e| LlmError::Inference(e.to_string()))?;
@@ -288,16 +338,24 @@ fn process_job(
     }
 
     // Greedy decoding: deterministic and reproducible (evals compare
-    // like-for-like). Temperature/penalty variants were trialled and showed
-    // no clear win on open prose (see ADR 0006); revisit with data.
-    // Address-form bans ride along as -inf logit biases.
-    let mut sampler = match banned_token_ids(model, job.address) {
-        biases if biases.is_empty() => LlamaSampler::greedy(),
-        biases => LlamaSampler::chain_simple([
-            LlamaSampler::logit_bias(model.n_vocab(), &biases),
-            LlamaSampler::greedy(),
-        ]),
-    };
+    // like-for-like). A mild repetition penalty rides along: pure greedy
+    // loops on its own tail ("... Friday and the report is due on Friday
+    // and ..."), and the penalty breaks the loop while staying
+    // argmax-deterministic. Address-form bans ride as -inf logit biases.
+    let biases = banned_token_ids(model, job.address);
+    let mut samplers = Vec::with_capacity(3);
+    if !biases.is_empty() {
+        samplers.push(LlamaSampler::logit_bias(model.n_vocab(), &biases));
+    }
+    samplers.push(LlamaSampler::penalties(
+        model.n_vocab(),
+        PENALTY_LAST_N,
+        PENALTY_REPEAT,
+        0.0,
+        0.0,
+    ));
+    samplers.push(LlamaSampler::greedy());
+    let mut sampler = LlamaSampler::chain_simple(samplers);
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut emitted = 0usize;
     let mut text = String::new();
@@ -305,12 +363,17 @@ fn process_job(
     let mut generated = 0usize;
     let mut first_token = true;
     let mut ttft = Duration::ZERO;
+    let mut last_partial = String::new();
 
     for _ in 0..want {
         if job.cancel.is_cancelled() {
             return Err(LlmError::Cancelled);
         }
-        let array = ctx.token_data_array();
+        let mut array = ctx.token_data_array();
+        // Run the sampler chain (logit-bias bans, repetition penalty)
+        // before choosing: without apply() the chain would only observe
+        // via accept() and never steer selection.
+        sampler.apply(&mut array);
         let (token, logprob) = if first_token && !fragment.is_empty() {
             match heal_first_token(model, &array, &fragment) {
                 Some(found) => found,
@@ -346,6 +409,25 @@ fn process_job(
             break;
         }
 
+        // Live partial (only when continuing — terminal chunks resolve via
+        // the final reply below). Same rules as the final text: stripped,
+        // long enough to matter, above the running gate, no violations.
+        // Clients paint at first-token time instead of sentence end.
+        if let Some(partial) = strip_healed_prefix(&text, &fragment, before_ends_ws) {
+            let running = (logprob_sum / generated as f64) as f32;
+            if partial.chars().count() >= 2
+                && partial != last_partial
+                && running >= job.threshold
+                && !predict_core::violates(&partial, job.address)
+            {
+                last_partial = partial.clone();
+                (job.on_partial)(PartialSentence {
+                    text: partial,
+                    confidence: running,
+                });
+            }
+        }
+
         // Feed the token back for the next step.
         let pos = cached.len() as i32;
         let mut batch = LlamaBatch::new(1, 1);
@@ -362,16 +444,15 @@ fn process_job(
     }
     // Strip the healed fragment: the first piece starts with it (after
     // one optional leading blank), so the suggestion continues the cursor.
-    let mut completion = text;
-    if !fragment.is_empty() {
-        let no_blank = completion.strip_prefix(' ').unwrap_or(&completion);
-        if let Some(stripped) = no_blank.strip_prefix(fragment.as_str()) {
-            completion = stripped.to_string();
-        } else {
-            return Ok(None);
-        }
-    }
+    let Some(completion) = strip_healed_prefix(&text, &fragment, before_ends_ws) else {
+        return Ok(None);
+    };
     if completion.trim().is_empty() {
+        return Ok(None);
+    }
+    // A ghost of pure punctuation (".", ",", "…") carries no information;
+    // completions must add at least one word character.
+    if !completion.chars().any(|c| c.is_alphanumeric()) {
         return Ok(None);
     }
     // Backstop for multi-token banned forms the logit bias cannot cover:
@@ -449,8 +530,34 @@ fn heal_first_token(
 #[cfg(test)]
 mod tests {
     use super::super::{Backend, CancelToken, LlmConfig, SentenceRequest, StopMode};
-    use super::{common_prefix_len, emit_complete, is_clause_end, is_sentence_end, truncate_to_last_chars};
+    use super::{
+        common_prefix_len, emit_complete, is_clause_end, is_sentence_end, strip_healed_prefix,
+        truncate_to_last_chars,
+    };
     use llama_cpp_2::token::LlamaToken;
+
+    /// Shared backend for opt-in model tests: llama.cpp allows a single
+    /// backend init per process, and one ~1 GB instance keeps machines that
+    /// also run predictd alive. `None` without PREDICT_MODEL_PATH (tests
+    /// pass vacuously, as before).
+    static TEST_BACKEND: std::sync::OnceLock<std::sync::Arc<super::LlamaBackend>> =
+        std::sync::OnceLock::new();
+
+    fn test_backend() -> Option<std::sync::Arc<super::LlamaBackend>> {
+        let path = std::env::var("PREDICT_MODEL_PATH").unwrap_or_default();
+        if path.is_empty() {
+            return None;
+        }
+        let backend = TEST_BACKEND.get_or_init(|| {
+            let config = LlmConfig {
+                enabled: true,
+                model_path: path,
+                ..Default::default()
+            };
+            std::sync::Arc::new(super::LlamaBackend::load(&config).expect("load test model"))
+        });
+        Some(std::sync::Arc::clone(backend))
+    }
 
     #[test]
     fn common_prefix_counts_matching_head() {
@@ -466,6 +573,20 @@ mod tests {
         assert_eq!(truncate_to_last_chars("hello", 10), "hello");
         assert_eq!(truncate_to_last_chars("hello", 3), "llo");
         assert_eq!(truncate_to_last_chars("grüße", 2), "ße");
+    }
+
+    #[test]
+    fn strip_healed_prefix_cases() {
+        // No fragment, whitespace before: redundant blank stripped.
+        assert_eq!(strip_healed_prefix(" fox.", "", true).as_deref(), Some("fox."));
+        // No fragment, other ending: model spacing kept.
+        assert_eq!(strip_healed_prefix(" And", "", false).as_deref(), Some(" And"));
+        // Leading blank + fragment stripped.
+        assert_eq!(strip_healed_prefix(" quick", "qui", false).as_deref(), Some("ck"));
+        assert_eq!(strip_healed_prefix("quick", "qui", false).as_deref(), Some("ck"));
+        // Mid-fragment partial: prefix absent, no emission.
+        assert_eq!(strip_healed_prefix("qu", "qui", false), None);
+        assert_eq!(strip_healed_prefix(" fox", "qui", false), None);
     }
 
     #[test]
@@ -509,18 +630,9 @@ mod tests {
     /// ban contains no du-family token (rejection shows as `None`).
     #[test]
     fn real_model_never_violates_ban() {
-        let path = std::env::var("PREDICT_MODEL_PATH").unwrap_or_default();
-        if path.is_empty() {
+        let Some(backend) = test_backend() else {
             return;
-        }
-        let config = LlmConfig {
-            enabled: true,
-            model_path: path,
-            max_tokens: 16,
-            confidence_threshold: -99.0,
-            ..Default::default()
         };
-        let backend = super::LlamaBackend::load(&config).unwrap();
         for before in [
             "Kannst du mir sagen, ob ",
             "Wenn du morgen Zeit hast, ",
@@ -541,22 +653,48 @@ mod tests {
         }
     }
 
+    /// Opt-in streaming test against a real GGUF (set PREDICT_MODEL_PATH).
+    /// Skipped silently otherwise. Asserts partials grow into the final text
+    /// and never dip below the gate.
+    #[test]
+    fn real_model_streams_gated_partials() {
+        use super::super::PartialSentence;
+        use std::sync::{Arc, Mutex};
+        let Some(backend) = test_backend() else {
+            return;
+        };
+        let req = SentenceRequest {
+            before: "the quick brown ".to_string(),
+            max_tokens: 16,
+            confidence_threshold: -1.5,
+            stop: StopMode::Sentence,
+            address: predict_core::AddressForm::None,
+        };
+        let partials = Arc::new(Mutex::new(Vec::<PartialSentence>::new()));
+        let sink = Arc::clone(&partials);
+        let out = backend
+            .complete_sentence_streaming(
+                &req,
+                &CancelToken::new(),
+                Box::new(move |p| sink.lock().unwrap().push(p)),
+            )
+            .unwrap()
+            .expect("familiar phrase should pass the gate");
+        let partials = partials.lock().unwrap();
+        assert!(!partials.is_empty(), "expected at least one partial");
+        for p in partials.iter() {
+            assert!(p.confidence >= -1.5, "partial below gate: {p:?}");
+            assert!(out.text.starts_with(&p.text), "partial not a prefix: {p:?}");
+        }
+    }
+
     /// Opt-in smoke test against a real GGUF (set PREDICT_MODEL_PATH).
     /// Skipped silently otherwise so plain `cargo test` stays fast.
     #[test]
     fn real_model_continues_text() {
-        let path = std::env::var("PREDICT_MODEL_PATH").unwrap_or_default();
-        if path.is_empty() {
+        let Some(backend) = test_backend() else {
             return;
-        }
-        let config = LlmConfig {
-            enabled: true,
-            model_path: path,
-            max_tokens: 16,
-            confidence_threshold: -99.0,
-            ..Default::default()
         };
-        let backend = super::LlamaBackend::load(&config).unwrap();
         let req = SentenceRequest {
             before: "the quick brown fox jumps over the lazy ".to_string(),
             max_tokens: 16,

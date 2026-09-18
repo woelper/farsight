@@ -944,7 +944,29 @@ fn handle_connection(
                         stop,
                         address: style.address_form,
                     };
-                    let result = cfg.backend.complete_sentence(&req, &cancel);
+                    // Stream partials live (same message shape, same
+                    // generation): clients paint at first-token time and
+                    // overwrite as the text grows. Stale generations are
+                    // filtered client-side; a cancelled worker just stops.
+                    let part_writer = Arc::clone(&writer);
+                    let part_cancel = cancel.clone();
+                    let part_style = style.style_id.clone();
+                    let on_partial =
+                        Box::new(move |partial: predict_llm::PartialSentence| {
+                            if part_cancel.is_cancelled() {
+                                return;
+                            }
+                            let reply = SentenceSuggestion {
+                                generation,
+                                text: partial.text,
+                                confidence: partial.confidence,
+                                style_id: part_style.clone(),
+                            };
+                            let _ = send_msg(&part_writer, &DaemonMsg::Sentence(reply));
+                        });
+                    let result =
+                        cfg.backend
+                            .complete_sentence_streaming(&req, &cancel, on_partial);
                     let fresh = {
                         let mut guard = match shared.lock() {
                             Ok(guard) => guard,
@@ -962,14 +984,38 @@ fn handle_connection(
                     if !fresh {
                         return;
                     }
-                    if let Ok(Some(out)) = result {
-                        let reply = SentenceSuggestion {
-                            generation,
-                            text: out.text,
-                            confidence: out.confidence,
-                            style_id: style.style_id.clone(),
-                        };
-                        let _ = send_msg(&writer, &DaemonMsg::Sentence(reply));
+                    match result {
+                        Ok(Some(out)) => {
+                            let reply = SentenceSuggestion {
+                                generation,
+                                text: out.text,
+                                confidence: out.confidence,
+                                style_id: style.style_id.clone(),
+                            };
+                            let _ = send_msg(&writer, &DaemonMsg::Sentence(reply));
+                        }
+                        // Gated or failed after partials were shown: retract
+                        // so no stale ghost lingers. Cancelled means a newer
+                        // generation owns the display — stay silent.
+                        Ok(None) => {
+                            let retract = SentenceSuggestion {
+                                generation,
+                                text: String::new(),
+                                confidence: f32::NEG_INFINITY,
+                                style_id: style.style_id.clone(),
+                            };
+                            let _ = send_msg(&writer, &DaemonMsg::Sentence(retract));
+                        }
+                        Err(predict_llm::LlmError::Cancelled) => {}
+                        Err(_) => {
+                            let retract = SentenceSuggestion {
+                                generation,
+                                text: String::new(),
+                                confidence: f32::NEG_INFINITY,
+                                style_id: style.style_id.clone(),
+                            };
+                            let _ = send_msg(&writer, &DaemonMsg::Sentence(retract));
+                        }
                     }
                 });
             }
@@ -1394,9 +1440,10 @@ mod tests {
         std::fs::remove_file(&sock).unwrap();
     }
 
-    /// A gated-out sentence stays silent (no reply, client times out).
+    /// A gated-out sentence retracts (empty text) rather than staying
+    /// silent, so clients clear any shown partials.
     #[test]
-    fn gated_sentence_gets_no_reply() {
+    fn gated_sentence_retracts() {
         let sock = std::env::temp_dir()
             .join(format!("predictd-gate-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
@@ -1422,8 +1469,12 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(300)))
             .unwrap();
-        let reply = read_daemon_msg(&mut client);
-        assert!(reply.is_err(), "gated sentence got a reply: {reply:?}");
+        let reply = match read_daemon_msg(&mut client).unwrap() {
+            DaemonMsg::Sentence(s) => s,
+            other => panic!("expected retract Sentence, got {other:?}"),
+        };
+        assert_eq!(reply.generation, 1);
+        assert!(reply.text.is_empty(), "retract must clear: {reply:?}");
 
         drop(client);
         server.join().unwrap();
