@@ -226,6 +226,24 @@ fn strip_healed_prefix(text: &str, fragment: &str, before_ends_ws: bool) -> Opti
         .map(str::to_string)
 }
 
+/// Median of token logprobs (higher is better, ≤ 0). Robust against a
+/// single forced outlier — the healed fragment starter is constrained to
+/// match the in-progress word and often scores far below the free
+/// continuation that follows it.
+fn median_logprob(logprobs: &[f32]) -> f32 {
+    let mut sorted: Vec<f32> = logprobs.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let n = sorted.len();
+    if n == 0 {
+        return f32::NEG_INFINITY;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
 /// Sentence-terminal punctuation (stop AFTER including it).
 fn is_sentence_end(text: &str) -> bool {
     text.ends_with(['.', '!', '?', '…'])
@@ -359,7 +377,7 @@ fn process_job(
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut emitted = 0usize;
     let mut text = String::new();
-    let mut logprob_sum = 0.0f64;
+    let mut token_logprobs: Vec<f32> = Vec::new();
     let mut generated = 0usize;
     let mut first_token = true;
     let mut ttft = Duration::ZERO;
@@ -390,7 +408,7 @@ fn process_job(
             break;
         }
         sampler.accept(token);
-        logprob_sum += f64::from(logprob);
+        token_logprobs.push(logprob);
         generated += 1;
 
         let piece = model
@@ -414,7 +432,7 @@ fn process_job(
         // long enough to matter, above the running gate, no violations.
         // Clients paint at first-token time instead of sentence end.
         if let Some(partial) = strip_healed_prefix(&text, &fragment, before_ends_ws) {
-            let running = (logprob_sum / generated as f64) as f32;
+            let running = median_logprob(&token_logprobs);
             if partial.chars().count() >= 2
                 && partial != last_partial
                 && running >= job.threshold
@@ -460,7 +478,7 @@ fn process_job(
     if predict_core::violates(&completion, job.address) {
         return Ok(None);
     }
-    let confidence = (logprob_sum / generated as f64) as f32;
+    let confidence = median_logprob(&token_logprobs);
     if confidence < job.threshold {
         return Ok(None);
     }
@@ -531,8 +549,8 @@ fn heal_first_token(
 mod tests {
     use super::super::{Backend, CancelToken, LlmConfig, SentenceRequest, StopMode};
     use super::{
-        common_prefix_len, emit_complete, is_clause_end, is_sentence_end, strip_healed_prefix,
-        truncate_to_last_chars,
+        common_prefix_len, emit_complete, is_clause_end, is_sentence_end, median_logprob,
+        strip_healed_prefix, truncate_to_last_chars,
     };
     use llama_cpp_2::token::LlamaToken;
 
@@ -573,6 +591,15 @@ mod tests {
         assert_eq!(truncate_to_last_chars("hello", 10), "hello");
         assert_eq!(truncate_to_last_chars("hello", 3), "llo");
         assert_eq!(truncate_to_last_chars("grüße", 2), "ße");
+    }
+
+    #[test]
+    fn median_logprob_cases() {
+        assert_eq!(median_logprob(&[]), f32::NEG_INFINITY);
+        assert_eq!(median_logprob(&[-2.0]), -2.0);
+        // One forced outlier must not sink the continuation.
+        assert_eq!(median_logprob(&[-8.0, -1.2, -1.4, -1.1, -1.3]), -1.3);
+        assert_eq!(median_logprob(&[-1.0, -3.0]), -2.0);
     }
 
     #[test]

@@ -38,7 +38,7 @@ cat > "$CONFIG_FILE" <<EOF
 enabled = true
 model_path = "$DATA_HOME/$MODEL_FILE"
 max_tokens = 32
-confidence_threshold = -1.5
+confidence_threshold = -2.0
 EOF
 
 echo "wrote $CONFIG_FILE"

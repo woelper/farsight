@@ -56,7 +56,7 @@ pub struct SentenceRequest {
     pub before: String,
     /// Generation cap (tokens).
     pub max_tokens: usize,
-    /// Minimum mean token logprob for the output to be returned.
+    /// Minimum median token logprob for the output to be returned.
     pub confidence_threshold: f32,
     /// Stop criterion (length policy).
     pub stop: StopMode,
@@ -69,7 +69,9 @@ pub struct SentenceRequest {
 pub struct SentenceOutput {
     /// Continuation AFTER `before` (mid-word fragment already stripped).
     pub text: String,
-    /// Mean token logprob over generated tokens (higher is better, ≤ 0).
+    /// Median token logprob over generated tokens (higher is better, ≤ 0).
+    /// Median, not mean: one forced low-probability token (the healed
+    /// fragment starter) must not sink an otherwise confident continuation.
     pub confidence: f32,
     /// Time from request start to the first sampled token.
     pub time_to_first_token: Duration,
@@ -77,14 +79,14 @@ pub struct SentenceOutput {
     pub tokens_generated: usize,
 }
 
-/// An in-progress sentence: text so far plus the running mean logprob.
+/// An in-progress sentence: text so far plus the running median logprob.
 /// Emitted live so clients can paint before generation finishes; the final
 /// [`SentenceOutput`] (or silence) still resolves the request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PartialSentence {
     /// Continuation so far (same stripping rules as [`SentenceOutput`]).
     pub text: String,
-    /// Mean token logprob over tokens generated so far.
+    /// Median token logprob over tokens generated so far.
     pub confidence: f32,
 }
 
@@ -149,7 +151,7 @@ pub struct LlmConfig {
     pub model_path: String,
     /// Generation cap per request.
     pub max_tokens: usize,
-    /// Minimum mean token logprob to surface a suggestion.
+    /// Minimum median token logprob to surface a suggestion.
     pub confidence_threshold: f32,
     /// Context window (tokens).
     pub n_ctx: u32,
@@ -163,7 +165,10 @@ impl Default for LlmConfig {
             enabled: false,
             model_path: String::new(),
             max_tokens: 32,
-            confidence_threshold: -1.5,
+            // Calibrated on everyday prose medians (good continuations
+            // land around -1.5..-2.2; -2.0 admits most while keeping the
+            // worst out). Tunable per install via confidence_threshold.
+            confidence_threshold: -2.0,
             n_ctx: 2048,
             n_threads: 0,
         }

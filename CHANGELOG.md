@@ -15,6 +15,10 @@ All notable changes to `predict` are documented here, per milestone.
   greedy loops ("… Friday and the report is due on Friday and …") are
   gone; completions must contain a word character (no "." ghosts) and no
   longer double spaces after the cursor.
+- Confidence is now the median token logprob (a forced healed fragment
+  starter no longer sinks good continuations) and the default gate moves
+  −1.5 → −2.0, calibrated on everyday-prose medians; still tunable via
+  `confidence_threshold`.
 
 ## [0.7.0] — M6 Linux desktop input
 
